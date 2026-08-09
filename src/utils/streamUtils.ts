@@ -40,6 +40,11 @@ export const createStreamResponse = (res: Response): StreamWriter => {
     // 客户端已断开时不再写入，避免无意义 I/O 与异常
     if (res.writableEnded || res.destroyed || !res.writable) return;
     res.write(`data: ${JSON.stringify(event)}\n\n`);
+    // compression 等中间件提供 flush 时立刻刷出，避免 SSE 被缓冲成整包
+    const flushable = res as Response & { flush?: () => void };
+    if (typeof flushable.flush === "function") {
+      flushable.flush();
+    }
   };
 
   return {

@@ -5,9 +5,16 @@ import path from "node:path";
 
 export type ChatRole = "user" | "assistant";
 
+/** 会话归属：登录用户优先 userId，否则匿名 clientId */
+export type ConversationOwner = {
+  clientId: string;
+  userId?: string | null;
+};
+
 export interface ConversationRow {
   id: string;
   client_id: string;
+  user_id: string | null;
   title: string;
   pinned: number;
   created_at: number;
@@ -53,11 +60,8 @@ if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
 }
 
-// 打开（或创建）data/chat.db，得到数据库连接对象 db
 const db = new Database(dbPath);
-// Write-Ahead Logging: db-wal文件，尚未完全合并的改动流水
 db.pragma("journal_mode = WAL");
-// 外键约束  => ON表示级联删除，OFF表示禁止级联删除
 db.pragma("foreign_keys = ON");
 
 db.exec(`
@@ -85,22 +89,38 @@ db.exec(`
     ON messages(conversation_id, created_at ASC);
 `);
 
-/** 兼容旧库：补充 pinned 列 */
 const conversationColumns = db
   .prepare(`PRAGMA table_info(conversations)`)
   .all() as { name: string }[];
+
 if (!conversationColumns.some((col) => col.name === "pinned")) {
   db.exec(
     `ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`,
   );
 }
 
+if (!conversationColumns.some((col) => col.name === "user_id")) {
+  db.exec(`ALTER TABLE conversations ADD COLUMN user_id TEXT`);
+}
+
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_conversations_client_pinned_updated
     ON conversations(client_id, pinned DESC, updated_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_conversations_user_pinned_updated
+    ON conversations(user_id, pinned DESC, updated_at DESC);
 `);
 
 const now = () => Date.now();
+
+const ownerWhere = (owner: ConversationOwner): { sql: string; params: string[] } => {
+  if (owner.userId) {
+    return { sql: `user_id = ?`, params: [owner.userId] };
+  }
+  return {
+    sql: `client_id = ? AND (user_id IS NULL OR user_id = '')`,
+    params: [owner.clientId],
+  };
+};
 
 export const truncateTitle = (text: string, maxLen = TITLE_MAX_LEN): string => {
   const normalized = text.trim().replace(/\s+/g, " ");
@@ -111,19 +131,25 @@ export const truncateTitle = (text: string, maxLen = TITLE_MAX_LEN): string => {
 };
 
 export const createConversation = (
-  clientId: string,
+  owner: ConversationOwner | string,
   title = "新对话",
 ): ConversationRow => {
+  const normalized: ConversationOwner =
+    typeof owner === "string" ? { clientId: owner } : owner;
+
   const id = randomUUID();
   const ts = now();
+  const userId = normalized.userId ?? null;
+
   db.prepare(
-    `INSERT INTO conversations (id, client_id, title, pinned, created_at, updated_at)
-     VALUES (?, ?, ?, 0, ?, ?)`,
-  ).run(id, clientId, title, ts, ts);
+    `INSERT INTO conversations (id, client_id, user_id, title, pinned, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 0, ?, ?)`,
+  ).run(id, normalized.clientId, userId, title, ts, ts);
 
   return {
     id,
-    client_id: clientId,
+    client_id: normalized.clientId,
+    user_id: userId,
     title,
     pinned: 0,
     created_at: ts,
@@ -133,20 +159,30 @@ export const createConversation = (
 
 export const getConversation = (
   id: string,
-  clientId: string,
+  owner: ConversationOwner | string,
 ): ConversationRow | null => {
+  const normalized: ConversationOwner =
+    typeof owner === "string" ? { clientId: owner } : owner;
+  const { sql, params } = ownerWhere(normalized);
+
   const row = db
     .prepare(
-      `SELECT id, client_id, title, pinned, created_at, updated_at
+      `SELECT id, client_id, user_id, title, pinned, created_at, updated_at
        FROM conversations
-       WHERE id = ? AND client_id = ?`,
+       WHERE id = ? AND ${sql}`,
     )
-    .get(id, clientId) as ConversationRow | undefined;
+    .get(id, ...params) as ConversationRow | undefined;
 
   return row ?? null;
 };
 
-export const listConversations = (clientId: string): ConversationSummary[] => {
+export const listConversations = (
+  owner: ConversationOwner | string,
+): ConversationSummary[] => {
+  const normalized: ConversationOwner =
+    typeof owner === "string" ? { clientId: owner } : owner;
+  const { sql, params } = ownerWhere(normalized);
+
   const rows = db
     .prepare(
       `SELECT
@@ -165,10 +201,10 @@ export const listConversations = (clientId: string): ConversationSummary[] => {
            ''
          ) AS preview
        FROM conversations c
-       WHERE c.client_id = ?
+       WHERE ${sql}
        ORDER BY c.pinned DESC, c.updated_at DESC`,
     )
-    .all(clientId) as {
+    .all(...params) as {
     id: string;
     title: string;
     pinned: number;
@@ -187,46 +223,61 @@ export const listConversations = (clientId: string): ConversationSummary[] => {
 
 export const renameConversation = (
   id: string,
-  clientId: string,
+  owner: ConversationOwner | string,
   title: string,
 ): ConversationRow | null => {
-  const normalized = title.trim().replace(/\s+/g, " ");
-  if (!normalized) return null;
+  const normalized: ConversationOwner =
+    typeof owner === "string" ? { clientId: owner } : owner;
+  const { sql, params } = ownerWhere(normalized);
 
-  const truncated = truncateTitle(normalized, 40);
+  const cleaned = title.trim().replace(/\s+/g, " ");
+  if (!cleaned) return null;
+
+  const truncated = truncateTitle(cleaned, 40);
   const result = db
     .prepare(
       `UPDATE conversations
        SET title = ?
-       WHERE id = ? AND client_id = ?`,
+       WHERE id = ? AND ${sql}`,
     )
-    .run(truncated, id, clientId);
+    .run(truncated, id, ...params);
 
   if (result.changes === 0) return null;
-  return getConversation(id, clientId);
+  return getConversation(id, normalized);
 };
 
 export const setConversationPinned = (
   id: string,
-  clientId: string,
+  owner: ConversationOwner | string,
   pinned: boolean,
 ): ConversationRow | null => {
+  const normalized: ConversationOwner =
+    typeof owner === "string" ? { clientId: owner } : owner;
+  const { sql, params } = ownerWhere(normalized);
+
   const result = db
     .prepare(
       `UPDATE conversations
        SET pinned = ?
-       WHERE id = ? AND client_id = ?`,
+       WHERE id = ? AND ${sql}`,
     )
-    .run(pinned ? 1 : 0, id, clientId);
+    .run(pinned ? 1 : 0, id, ...params);
 
   if (result.changes === 0) return null;
-  return getConversation(id, clientId);
+  return getConversation(id, normalized);
 };
 
-export const deleteConversation = (id: string, clientId: string): boolean => {
+export const deleteConversation = (
+  id: string,
+  owner: ConversationOwner | string,
+): boolean => {
+  const normalized: ConversationOwner =
+    typeof owner === "string" ? { clientId: owner } : owner;
+  const { sql, params } = ownerWhere(normalized);
+
   const result = db
-    .prepare(`DELETE FROM conversations WHERE id = ? AND client_id = ?`)
-    .run(id, clientId);
+    .prepare(`DELETE FROM conversations WHERE id = ? AND ${sql}`)
+    .run(id, ...params);
   return result.changes > 0;
 };
 
@@ -263,7 +314,6 @@ export const listMessages = (conversationId: string): MessageRow[] => {
     .all(conversationId) as MessageRow[];
 };
 
-/** 取最近 N 条消息，供 LLM 多轮上下文（按时间正序返回） */
 export const listRecentMessages = (
   conversationId: string,
   limit = MAX_HISTORY_MESSAGES,
@@ -283,31 +333,35 @@ export const listRecentMessages = (
 
 export const touchConversation = (
   id: string,
-  clientId: string,
+  owner: ConversationOwner | string,
   title?: string,
 ): void => {
+  const normalized: ConversationOwner =
+    typeof owner === "string" ? { clientId: owner } : owner;
+  const { sql, params } = ownerWhere(normalized);
   const ts = now();
+
   if (title !== undefined) {
     db.prepare(
       `UPDATE conversations
        SET updated_at = ?, title = ?
-       WHERE id = ? AND client_id = ?`,
-    ).run(ts, title, id, clientId);
+       WHERE id = ? AND ${sql}`,
+    ).run(ts, title, id, ...params);
     return;
   }
 
   db.prepare(
     `UPDATE conversations
      SET updated_at = ?
-     WHERE id = ? AND client_id = ?`,
-  ).run(ts, id, clientId);
+     WHERE id = ? AND ${sql}`,
+  ).run(ts, id, ...params);
 };
 
 export const getConversationDetail = (
   id: string,
-  clientId: string,
+  owner: ConversationOwner | string,
 ): ConversationDetail | null => {
-  const conversation = getConversation(id, clientId);
+  const conversation = getConversation(id, owner);
   if (!conversation) return null;
 
   const messages = listMessages(id).map((m) => ({
@@ -324,6 +378,22 @@ export const getConversationDetail = (
     updatedAt: conversation.updated_at,
     messages,
   };
+};
+
+/** 将当前设备匿名会话合并到登录用户 */
+export const mergeAnonymousConversations = (
+  userId: string,
+  clientId: string,
+): number => {
+  const result = db
+    .prepare(
+      `UPDATE conversations
+       SET user_id = ?
+       WHERE client_id = ?
+         AND (user_id IS NULL OR user_id = '')`,
+    )
+    .run(userId, clientId);
+  return result.changes;
 };
 
 export const MAX_CHAT_HISTORY = MAX_HISTORY_MESSAGES;

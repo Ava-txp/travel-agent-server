@@ -1,11 +1,15 @@
-import { Router, type Request, type Response } from "express";
+import { Router, type Response } from "express";
 import travelService from "../service/travelService.js";
 import { createStreamResponse } from "../utils/streamUtils.js";
 import * as chatStore from "../db/chatStore.js";
+import type { ConversationOwner } from "../db/chatStore.js";
+import * as planStore from "../db/planStore.js";
+import { reverseGeocode } from "../agent/tools.js";
+import { optionalAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const router = Router();
 
-const requireClientId = (req: Request, res: Response): string | null => {
+const requireClientId = (req: AuthedRequest, res: Response): string | null => {
   const clientId = req.header("X-Client-Id")?.trim();
   if (!clientId) {
     res.status(400).json({
@@ -17,7 +21,19 @@ const requireClientId = (req: Request, res: Response): string | null => {
   return clientId;
 };
 
-router.post("/recommend", async (req: Request, res: Response) => {
+const resolveOwner = (
+  req: AuthedRequest,
+  res: Response,
+): ConversationOwner | null => {
+  const clientId = requireClientId(req, res);
+  if (!clientId) return null;
+  return {
+    clientId,
+    userId: req.user?.id ?? null,
+  };
+};
+
+router.post("/recommend", optionalAuth, async (req: AuthedRequest, res) => {
   try {
     const { city, budget, days } = req.body || {};
 
@@ -31,9 +47,42 @@ router.post("/recommend", async (req: Request, res: Response) => {
     const result = await travelService.recommend(city, budget, days);
     console.log("准备返回给客户端的数据", result);
 
+    // 规划成功后落库，便于「规划记录」查询
+    let data: unknown = result;
+    const isSuccess =
+      result &&
+      typeof result === "object" &&
+      (result as { success?: unknown }).success !== false;
+
+    if (isSuccess) {
+      const clientId = req.header("X-Client-Id")?.trim();
+      if (clientId) {
+        try {
+          const planResult = result as {
+            city?: string;
+            days?: number;
+            totalBudget?: number;
+          };
+          const saved = planStore.createPlan(
+            { clientId, userId: req.user?.id ?? null },
+            {
+              city: planResult.city || String(city),
+              days: Number(planResult.days) || Number(days),
+              totalBudget:
+                Number(planResult.totalBudget) || Number(budget),
+              content: result,
+            },
+          );
+          data = { ...(result as object), id: saved.id };
+        } catch (saveError) {
+          console.error("保存规划记录失败", saveError);
+        }
+      }
+    }
+
     return res.status(200).json({
       status: "ok",
-      data: result,
+      data,
     });
   } catch {
     return res.status(500).json({
@@ -43,16 +92,54 @@ router.post("/recommend", async (req: Request, res: Response) => {
   }
 });
 
-router.post("/chat", async (req: Request, res: Response) => {
-  const clientId = requireClientId(req, res);
-  if (!clientId) return;
+router.post("/chat", optionalAuth, async (req: AuthedRequest, res) => {
+  const owner = resolveOwner(req, res);
+  if (!owner) return;
 
-  const { message, conversationId } = (req.body ?? {}) as {
+  const { message, conversationId, location } = (req.body ?? {}) as {
     message?: string;
     conversationId?: string;
+    location?: {
+      lat?: unknown;
+      lon?: unknown;
+      accuracy?: unknown;
+      city?: unknown;
+      displayName?: unknown;
+    };
   };
 
-  console.log("message", message, "conversationId", conversationId);
+  const parsedLocation =
+    location &&
+    typeof location.lat === "number" &&
+    typeof location.lon === "number" &&
+    Number.isFinite(location.lat) &&
+    Number.isFinite(location.lon)
+      ? {
+          lat: location.lat,
+          lon: location.lon,
+          ...(typeof location.accuracy === "number"
+            ? { accuracy: location.accuracy }
+            : {}),
+          ...(typeof location.city === "string" && location.city.trim()
+            ? { city: location.city.trim() }
+            : {}),
+          ...(typeof location.displayName === "string" &&
+          location.displayName.trim()
+            ? { displayName: location.displayName.trim() }
+            : {}),
+        }
+      : null;
+
+  console.log(
+    "message",
+    message,
+    "conversationId",
+    conversationId,
+    "userId",
+    owner.userId,
+    "location",
+    parsedLocation,
+  );
 
   if (!message?.trim()) {
     return res.status(400).json({
@@ -62,7 +149,7 @@ router.post("/chat", async (req: Request, res: Response) => {
   }
 
   let conversation = conversationId
-    ? chatStore.getConversation(conversationId, clientId)
+    ? chatStore.getConversation(conversationId, owner)
     : null;
 
   if (conversationId && !conversation) {
@@ -74,12 +161,11 @@ router.post("/chat", async (req: Request, res: Response) => {
 
   if (!conversation) {
     conversation = chatStore.createConversation(
-      clientId,
+      owner,
       chatStore.truncateTitle(message),
     );
   }
 
-  // 先落库用户消息；首条消息先用截断标题占位，再异步 LLM 总结更新
   const existingMessages = chatStore.listMessages(conversation.id);
   const isFirstUserMessage = existingMessages.length === 0;
   chatStore.addMessage(conversation.id, "user", message);
@@ -87,7 +173,7 @@ router.post("/chat", async (req: Request, res: Response) => {
   if (isFirstUserMessage) {
     chatStore.touchConversation(
       conversation.id,
-      clientId,
+      owner,
       chatStore.truncateTitle(message),
     );
 
@@ -98,15 +184,14 @@ router.post("/chat", async (req: Request, res: Response) => {
       if (!summary) return;
       chatStore.touchConversation(
         conversationIdForTitle,
-        clientId,
+        owner,
         chatStore.truncateTitle(summary),
       );
     })();
   } else {
-    chatStore.touchConversation(conversation.id, clientId);
+    chatStore.touchConversation(conversation.id, owner);
   }
 
-  // 读最近历史，并去掉刚写入的本轮 user（chat 会单独追加本轮 message）
   const recent = chatStore.listRecentMessages(
     conversation.id,
     chatStore.MAX_CHAT_HISTORY,
@@ -141,6 +226,7 @@ router.post("/chat", async (req: Request, res: Response) => {
         role: m.role,
         content: m.content,
       })),
+      location: parsedLocation,
       streamCallback: (chunk) => {
         if (abortController.signal.aborted || res.writableEnded) return;
         stream.writeChunk(chunk);
@@ -148,10 +234,9 @@ router.post("/chat", async (req: Request, res: Response) => {
       signal: abortController.signal,
     });
 
-    // abort 后仍落库已生成的部分 assistant 文本；可不写 done
     if (result.response?.trim()) {
       chatStore.addMessage(conversationIdForDone, "assistant", result.response);
-      chatStore.touchConversation(conversationIdForDone, clientId);
+      chatStore.touchConversation(conversationIdForDone, owner);
     }
 
     if (result.aborted || abortController.signal.aborted || res.writableEnded) {
@@ -189,20 +274,62 @@ router.post("/chat", async (req: Request, res: Response) => {
   }
 });
 
-router.get("/conversations", (req: Request, res: Response) => {
+router.get("/location/reverse", optionalAuth, async (req: AuthedRequest, res) => {
   const clientId = requireClientId(req, res);
   if (!clientId) return;
 
-  const data = chatStore.listConversations(clientId);
+  const lat = Number(req.query.lat);
+  const lon = Number(req.query.lon);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return res.status(400).json({
+      status: "error",
+      message: "Missing or invalid query: lat, lon",
+    });
+  }
+
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+    return res.status(400).json({
+      status: "error",
+      message: "lat/lon out of range",
+    });
+  }
+
+  try {
+    const result = await reverseGeocode(lat, lon);
+    return res.status(200).json({
+      status: "ok",
+      data: {
+        lat,
+        lon,
+        city: result.city,
+        displayName: result.displayName,
+      },
+    });
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Reverse geocode failed";
+    return res.status(502).json({
+      status: "error",
+      message,
+    });
+  }
+});
+
+router.get("/conversations", optionalAuth, (req: AuthedRequest, res) => {
+  const owner = resolveOwner(req, res);
+  if (!owner) return;
+
+  const data = chatStore.listConversations(owner);
   return res.status(200).json({ status: "ok", data });
 });
 
-router.get("/conversations/:id", (req: Request, res: Response) => {
-  const clientId = requireClientId(req, res);
-  if (!clientId) return;
+router.get("/conversations/:id", optionalAuth, (req: AuthedRequest, res) => {
+  const owner = resolveOwner(req, res);
+  if (!owner) return;
 
   const id = String(req.params.id);
-  const detail = chatStore.getConversationDetail(id, clientId);
+  const detail = chatStore.getConversationDetail(id, owner);
   if (!detail) {
     return res.status(404).json({
       status: "error",
@@ -213,11 +340,11 @@ router.get("/conversations/:id", (req: Request, res: Response) => {
   return res.status(200).json({ status: "ok", data: detail });
 });
 
-router.post("/conversations", (req: Request, res: Response) => {
-  const clientId = requireClientId(req, res);
-  if (!clientId) return;
+router.post("/conversations", optionalAuth, (req: AuthedRequest, res) => {
+  const owner = resolveOwner(req, res);
+  if (!owner) return;
 
-  const conversation = chatStore.createConversation(clientId, "新对话");
+  const conversation = chatStore.createConversation(owner, "新对话");
   return res.status(200).json({
     status: "ok",
     data: {
@@ -229,12 +356,12 @@ router.post("/conversations", (req: Request, res: Response) => {
   });
 });
 
-router.delete("/conversations/:id", (req: Request, res: Response) => {
-  const clientId = requireClientId(req, res);
-  if (!clientId) return;
+router.delete("/conversations/:id", optionalAuth, (req: AuthedRequest, res) => {
+  const owner = resolveOwner(req, res);
+  if (!owner) return;
 
   const id = String(req.params.id);
-  const deleted = chatStore.deleteConversation(id, clientId);
+  const deleted = chatStore.deleteConversation(id, owner);
   if (!deleted) {
     return res.status(404).json({
       status: "error",
@@ -245,9 +372,9 @@ router.delete("/conversations/:id", (req: Request, res: Response) => {
   return res.status(200).json({ status: "ok" });
 });
 
-router.patch("/conversations/:id", (req: Request, res: Response) => {
-  const clientId = requireClientId(req, res);
-  if (!clientId) return;
+router.patch("/conversations/:id", optionalAuth, (req: AuthedRequest, res) => {
+  const owner = resolveOwner(req, res);
+  if (!owner) return;
 
   const id = String(req.params.id);
   const { title, pinned } = (req.body || {}) as {
@@ -264,7 +391,7 @@ router.patch("/conversations/:id", (req: Request, res: Response) => {
     });
   }
 
-  if (!chatStore.getConversation(id, clientId)) {
+  if (!chatStore.getConversation(id, owner)) {
     return res.status(404).json({
       status: "error",
       message: "Conversation not found",
@@ -272,7 +399,7 @@ router.patch("/conversations/:id", (req: Request, res: Response) => {
   }
 
   if (hasTitle) {
-    const renamed = chatStore.renameConversation(id, clientId, title);
+    const renamed = chatStore.renameConversation(id, owner, title);
     if (!renamed) {
       return res.status(400).json({
         status: "error",
@@ -282,10 +409,10 @@ router.patch("/conversations/:id", (req: Request, res: Response) => {
   }
 
   if (hasPinned) {
-    chatStore.setConversationPinned(id, clientId, pinned);
+    chatStore.setConversationPinned(id, owner, pinned);
   }
 
-  const conversation = chatStore.getConversation(id, clientId);
+  const conversation = chatStore.getConversation(id, owner);
   if (!conversation) {
     return res.status(404).json({
       status: "error",
@@ -302,6 +429,46 @@ router.patch("/conversations/:id", (req: Request, res: Response) => {
       updatedAt: conversation.updated_at,
     },
   });
+});
+
+router.get("/plans", optionalAuth, (req: AuthedRequest, res) => {
+  const owner = resolveOwner(req, res);
+  if (!owner) return;
+
+  const data = planStore.listPlans(owner);
+  return res.status(200).json({ status: "ok", data });
+});
+
+router.get("/plans/:id", optionalAuth, (req: AuthedRequest, res) => {
+  const owner = resolveOwner(req, res);
+  if (!owner) return;
+
+  const id = String(req.params.id);
+  const detail = planStore.getPlanDetail(id, owner);
+  if (!detail) {
+    return res.status(404).json({
+      status: "error",
+      message: "Plan not found",
+    });
+  }
+
+  return res.status(200).json({ status: "ok", data: detail });
+});
+
+router.delete("/plans/:id", optionalAuth, (req: AuthedRequest, res) => {
+  const owner = resolveOwner(req, res);
+  if (!owner) return;
+
+  const id = String(req.params.id);
+  const deleted = planStore.deletePlan(id, owner);
+  if (!deleted) {
+    return res.status(404).json({
+      status: "error",
+      message: "Plan not found",
+    });
+  }
+
+  return res.status(200).json({ status: "ok" });
 });
 
 export default router;

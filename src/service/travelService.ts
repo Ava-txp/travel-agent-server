@@ -1,27 +1,34 @@
 import { ChatOpenAI } from "@langchain/openai";
 import type { MessageContent } from "@langchain/core/messages";
-import { AIMessage, HumanMessage, SystemMessage } from "langchain";
+import { HumanMessage, SystemMessage } from "langchain";
+import {
+  TravelAgent,
+  type ChatHistoryItem,
+  type ChatStreamCallback,
+  type UserLocationInput,
+} from "../agent/travelAgent.js";
 
 /** 流式对话：每收到一段文本就回调一次 */
-export type ChatStreamCallback = (chunk: string) => void;
-
-export type ChatHistoryItem = {
-  role: "user" | "assistant";
-  content: string;
-};
+export type { ChatStreamCallback, ChatHistoryItem, UserLocationInput };
 
 export type ChatParams = {
   message: string;
   history?: ChatHistoryItem[];
   streamCallback: ChatStreamCallback;
   signal?: AbortSignal;
+  /** 评测时可强制工具打桩 */
+  dryTools?: boolean;
+  /** 前端浏览器定位 */
+  location?: UserLocationInput | null;
 };
 
 class TravelService {
   private llm: ChatOpenAI;
+  private agent: TravelAgent;
 
   constructor() {
     this.llm = this.initLLM();
+    this.agent = new TravelAgent(this.llm);
   }
 
   /**
@@ -214,19 +221,6 @@ class TravelService {
       .join("");
   }
 
-  private isAbortError(error: unknown, signal?: AbortSignal): boolean {
-    if (signal?.aborted) return true;
-    if (!error || typeof error !== "object") return false;
-
-    const name = "name" in error ? String(error.name) : "";
-    const message = "message" in error ? String(error.message) : "";
-
-    return (
-      name === "AbortError" ||
-      /abor(t|ted)/i.test(message)
-    );
-  }
-
   /**
    * 根据用户首条消息生成短标题（非流式）。
    * 失败时返回 null，由调用方保留截断标题兜底。
@@ -263,67 +257,11 @@ class TravelService {
   }
 
   /**
-   * 流式对话处理（支持多轮 history）。
+   * 流式对话：委托 Travel Agent（Tool Calling + RAG）。
    * 传入 signal 后，客户端断开可取消上游大模型请求。
    */
-  async chat({
-    message,
-    history = [],
-    streamCallback,
-    signal,
-  }: ChatParams) {
-    let fullText = "";
-
-    try {
-      const systemPrompt = `你是一个友好的旅游助手，请用中文回答用户关于旅游的问题。`;
-
-      const historyMessages = history.map((item) =>
-        item.role === "assistant"
-          ? new AIMessage(item.content)
-          : new HumanMessage(item.content),
-      );
-
-      const messages = [
-        new SystemMessage(systemPrompt),
-        ...historyMessages,
-        new HumanMessage(message),
-      ];
-
-      // stream() 返回异步可迭代对象；signal 用于取消上游 LLM HTTP 请求
-      const stream = await this.llm.stream(messages, { signal });
-
-      // for await：每来一个 chunk 就处理一次，而不是等全部生成完
-      for await (const chunk of stream) {
-        if (signal?.aborted) break;
-
-        const text = this.toTextContent(chunk.content);
-        if (text) {
-          fullText += text;
-          streamCallback(text);
-        }
-      }
-
-      return {
-        success: true as const,
-        aborted: Boolean(signal?.aborted),
-        response: fullText,
-      };
-    } catch (error) {
-      if (this.isAbortError(error, signal)) {
-        console.log("chat aborted by client, partial length:", fullText.length);
-        return {
-          success: true as const,
-          aborted: true,
-          response: fullText,
-        };
-      }
-
-      return {
-        success: false as const,
-        aborted: false,
-        message: error instanceof Error ? error.message : error,
-      };
-    }
+  async chat(params: ChatParams) {
+    return this.agent.chat(params);
   }
 }
 

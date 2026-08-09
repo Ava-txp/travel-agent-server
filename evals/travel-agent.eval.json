@@ -1,0 +1,77 @@
+[
+  {
+    "id": "weather-beijing",
+    "query": "北京明天天气怎么样？",
+    "expectTools": ["get_weather"],
+    "expectKeywordsAny": ["北京", "天气", "温度", "℃", "度"],
+    "requireRag": false
+  },
+  {
+    "id": "weather-shanghai",
+    "query": "上海今天适合出门吗，看看天气",
+    "expectTools": ["get_weather"],
+    "expectKeywordsAny": ["上海", "天气", "温度", "℃"],
+    "requireRag": false
+  },
+  {
+    "id": "geocode-westlake",
+    "query": "杭州西湖的大概地理位置和坐标是多少？",
+    "expectTools": ["geocode_location"],
+    "expectKeywordsAny": ["杭州", "西湖", "纬度", "经度", "坐标"],
+    "requireRag": false
+  },
+  {
+    "id": "attractions-chengdu",
+    "query": "成都有哪些必去景点？请先查询景点知识库再回答。",
+    "expectTools": ["search_attractions"],
+    "expectKeywordsAny": ["熊猫", "宽窄巷子", "都江堰", "锦里"],
+    "requireRag": true
+  },
+  {
+    "id": "attractions-beijing-rag",
+    "query": "去北京玩，推荐几个经典景点",
+    "expectToolsAny": ["search_attractions"],
+    "acceptRagWithoutTools": true,
+    "expectKeywordsAny": ["故宫", "长城", "颐和园"],
+    "requireRag": true
+  },
+  {
+    "id": "guide-hangzhou-rag",
+    "query": "杭州西湖游玩攻略，交通和美食有什么建议？",
+    "expectToolsAny": ["search_travel_guides"],
+    "acceptRagWithoutTools": true,
+    "expectKeywordsAny": ["西湖", "地铁", "杭帮", "龙井"],
+    "requireRag": true
+  },
+  {
+    "id": "guide-xian",
+    "query": "西安三日游怎么安排比较好？请先检索攻略知识库。",
+    "expectToolsAny": ["search_travel_guides", "search_attractions"],
+    "expectKeywordsAny": ["兵马俑", "城墙", "回民街"],
+    "requireRag": true
+  },
+  {
+    "id": "attractions-tokyo-rag",
+    "query": "东京有什么值得去的景点？",
+    "expectToolsAny": ["search_attractions"],
+    "acceptRagWithoutTools": true,
+    "expectKeywordsAny": ["浅草", "涩谷", "秋叶原"],
+    "requireRag": true
+  },
+  {
+    "id": "chitchat-no-tools",
+    "query": "你好，你是谁？",
+    "expectTools": [],
+    "forbidTools": ["get_weather", "geocode_location"],
+    "expectKeywordsAny": ["旅游", "助手", "帮", "你好"],
+    "requireRag": false
+  },
+  {
+    "id": "mixed-shanghai-food-guide",
+    "query": "上海美食和游玩攻略给我一些建议",
+    "expectToolsAny": ["search_travel_guides", "search_attractions"],
+    "acceptRagWithoutTools": true,
+    "expectKeywordsAny": ["上海", "外滩", "小笼", "生煎", "本帮"],
+    "requireRag": true
+  }
+]

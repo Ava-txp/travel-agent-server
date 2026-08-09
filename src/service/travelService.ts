@@ -1,9 +1,21 @@
 import { ChatOpenAI } from "@langchain/openai";
 import type { MessageContent } from "@langchain/core/messages";
-import { HumanMessage, SystemMessage } from "langchain";
+import { AIMessage, HumanMessage, SystemMessage } from "langchain";
 
 /** 流式对话：每收到一段文本就回调一次 */
 export type ChatStreamCallback = (chunk: string) => void;
+
+export type ChatHistoryItem = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+export type ChatParams = {
+  message: string;
+  history?: ChatHistoryItem[];
+  streamCallback: ChatStreamCallback;
+  signal?: AbortSignal;
+};
 
 class TravelService {
   private llm: ChatOpenAI;
@@ -216,21 +228,65 @@ class TravelService {
   }
 
   /**
-   * 流式对话处理。
+   * 根据用户首条消息生成短标题（非流式）。
+   * 失败时返回 null，由调用方保留截断标题兜底。
+   */
+  async summarizeTitle(userMessage: string): Promise<string | null> {
+    const content = userMessage.trim();
+    if (!content) return null;
+
+    try {
+      const messages = [
+        new SystemMessage(
+          `你是会话标题生成器。请根据用户的第一条消息，生成简洁的中文会话标题。
+要求：
+1. 只输出标题本身，不要引号、解释或其它多余文字
+2. 不超过 20 个字
+3. 尽量体现目的地、天数或核心诉求`,
+        ),
+        new HumanMessage(content),
+      ];
+
+      // invoke 拿完整结果，不走流式对话路径
+      const response = await this.llm.invoke(messages);
+
+      const text = this.toTextContent(response.content)
+        .trim()
+        .replace(/^["'「『]+|["'」』]+$/g, "")
+        .replace(/\s+/g, " ");
+
+      return text || null;
+    } catch (error) {
+      console.error("summarizeTitle failed:", error);
+      return null;
+    }
+  }
+
+  /**
+   * 流式对话处理（支持多轮 history）。
    * 传入 signal 后，客户端断开可取消上游大模型请求。
    */
-  async chat(
-    message: string,
-    streamCallback: ChatStreamCallback,
-    signal?: AbortSignal,
-  ) {
+  async chat({
+    message,
+    history = [],
+    streamCallback,
+    signal,
+  }: ChatParams) {
     let fullText = "";
 
     try {
       const systemPrompt = `你是一个友好的旅游助手，请用中文回答用户关于旅游的问题。`;
+
+      const historyMessages = history.map((item) =>
+        item.role === "assistant"
+          ? new AIMessage(item.content)
+          : new HumanMessage(item.content),
+      );
+
       const messages = [
-        new SystemMessage(systemPrompt), // role: "system"
-        new HumanMessage(message), // role: "user"
+        new SystemMessage(systemPrompt),
+        ...historyMessages,
+        new HumanMessage(message),
       ];
 
       // stream() 返回异步可迭代对象；signal 用于取消上游 LLM HTTP 请求

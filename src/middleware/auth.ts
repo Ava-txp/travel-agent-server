@@ -23,11 +23,27 @@ const getJwtSecret = (): string => {
   return secret;
 };
 
+/**
+ * ============== JWT 签名过程 ==============
+  header JSON ──► Base64URL ──┐
+                              ├──► "hdr.pay" ──► HMAC-SHA256(密钥) ──► Base64URL ──► signature
+  payload JSON ─► Base64URL ──┘
+  
+  最终(jwt.sign(...args)的返回结果) header.payload.signature ──► JWT Token
+ */
+
+/**
+ * ============== satisfies 类型检查运算符 ==============
+ * 既要符合 JwtPayload，又保留实际推断；字段写错会编译报错
+ */
 export const signAccessToken = (user: AuthUser): string => {
   const expiresIn = process.env.JWT_EXPIRES_IN?.trim() || "7d";
   return jwt.sign(
+    // payload: 写进 token 的内容
     { sub: user.id, account: user.account } satisfies JwtPayload,
+    // secretOrPrivateKey: 用来签名的密钥  =>  用 JWT_SECRET 做 HMAC 签名密钥
     getJwtSecret(),
+    // options?: 签发选项 => 让 token 在 expiresIn 后过期（默认 7 天）
     { expiresIn } as jwt.SignOptions,
   );
 };
@@ -76,7 +92,9 @@ export const requireAuth = (
   }
   const user = verifyAccessToken(token);
   if (!user) {
-    res.status(401).json({ status: "error", message: "Invalid or expired token" });
+    res
+      .status(401)
+      .json({ status: "error", message: "Invalid or expired token" });
     return;
   }
   req.user = user;

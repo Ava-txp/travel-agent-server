@@ -116,9 +116,9 @@ if (!conversationColumns.some((col) => col.name === "user_id")) {
   db.exec(`ALTER TABLE conversations ADD COLUMN user_id TEXT`);
 }
 
-const messageColumns = db
-  .prepare(`PRAGMA table_info(messages)`)
-  .all() as { name: string }[];
+const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as {
+  name: string;
+}[];
 
 if (!messageColumns.some((col) => col.name === "attachments_json")) {
   db.exec(`ALTER TABLE messages ADD COLUMN attachments_json TEXT`);
@@ -185,7 +185,9 @@ const mapMessageRow = (row: {
 
 const now = () => Date.now();
 
-const ownerWhere = (owner: ConversationOwner): { sql: string; params: string[] } => {
+const ownerWhere = (
+  owner: ConversationOwner,
+): { sql: string; params: string[] } => {
   if (owner.userId) {
     return { sql: `user_id = ?`, params: [owner.userId] };
   }
@@ -495,7 +497,21 @@ export const getConversationDetail = (
   };
 };
 
-/** 将当前设备匿名会话合并到登录用户 */
+/** 将当前设备匿名会话合并到登录用户
+ * =============== 正确使用方式 ===============
+ * 通过run注入参数可以防止sql注入
+ *
+ * =============== 错误使用方式 ===============
+ * exec(`UPDATE conversations SET user_id = '${userId}' WHERE client_id = '${clientId}'`);
+ * 模板字符串可能会导致sql注入，eg.clientId = '; DROP TABLE conversations; --'
+ *
+ * =============== 注意事项 ===============
+ * user_id IS NULL OR user_id = ''
+ * 只合并「还没挂到正式用户」的会话，避免覆盖已经属于别人的记录。
+ *
+ * :clientId, :userId 是命名占位符，需要通过run注入对象形式的参数。
+ * ? 位置占位符，需要通过run按顺序注入参数(平铺模式)。
+ */
 export const mergeAnonymousConversations = (
   userId: string,
   clientId: string,
@@ -503,11 +519,11 @@ export const mergeAnonymousConversations = (
   const result = db
     .prepare(
       `UPDATE conversations
-       SET user_id = ?
-       WHERE client_id = ?
+       SET user_id = :userId
+       WHERE client_id = :clientId
          AND (user_id IS NULL OR user_id = '')`,
     )
-    .run(userId, clientId);
+    .run({ userId, clientId });
   return result.changes;
 };
 

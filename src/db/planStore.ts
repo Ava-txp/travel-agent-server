@@ -119,18 +119,18 @@ export const createPlan = (
   db.prepare(
     `INSERT INTO travel_plans
       (id, client_id, user_id, city, days, total_budget, content, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
+     VALUES (:id, :clientId, :userId, :city, :days, :totalBudget, :content, :createdAt, :updatedAt)`,
+  ).run({
     id,
-    owner.clientId,
+    clientId: owner.clientId,
     userId,
     city,
     days,
     totalBudget,
     content,
-    ts,
-    ts,
-  );
+    createdAt: ts,
+    updatedAt: ts,
+  });
 
   return {
     id,
@@ -143,10 +143,7 @@ export const createPlan = (
   };
 };
 
-export const getPlan = (
-  id: string,
-  owner: PlanOwner,
-): PlanRow | null => {
+export const getPlan = (id: string, owner: PlanOwner): PlanRow | null => {
   const { sql, params } = ownerWhere(owner);
   const row = db
     .prepare(
@@ -202,10 +199,10 @@ export const mergeAnonymousPlans = (
   const result = db
     .prepare(
       `UPDATE travel_plans
-       SET user_id = ?
-       WHERE client_id = ?
+       SET user_id = :userId
+       WHERE client_id = :clientId
          AND (user_id IS NULL OR user_id = '')`,
     )
-    .run(userId, clientId);
+    .run({ userId, clientId });
   return result.changes;
 };

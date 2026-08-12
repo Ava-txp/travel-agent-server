@@ -61,8 +61,8 @@ export const createUser = (
   const ts = now();
   db.prepare(
     `INSERT INTO users (id, account, password_hash, nickname, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(id, account, passwordHash, nickname, ts, ts);
+     VALUES (:id, :account, :passwordHash, :nickname, :createdAt, :updatedAt)`,
+  ).run({ id, account, passwordHash, nickname, createdAt: ts, updatedAt: ts });
 
   return {
     id,
@@ -72,13 +72,17 @@ export const createUser = (
   };
 };
 
+/**
+ * 通过账号查找用户
+ * get: 执行查询，并返回 最多一行 结果对象；没有匹配行时返回 undefined
+ */
 export const findUserByAccount = (account: string): UserRow | null => {
   const row = db
     .prepare(
       `SELECT id, account, password_hash, nickname, created_at, updated_at
-       FROM users WHERE account = ?`,
+       FROM users WHERE account = :account`,
     )
-    .get(account) as UserRow | undefined;
+    .get({ account }) as UserRow | undefined;
   return row ?? null;
 };
 

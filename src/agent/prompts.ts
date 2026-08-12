@@ -8,6 +8,7 @@ export type LocationContext = {
 export const buildTravelAgentSystemPrompt = (
   ragContext: string,
   location?: LocationContext | null,
+  sceneContext?: string | null,
 ): string => {
   const ragBlock = ragContext.trim()
     ? `## 参考资料（来自本地攻略知识库，请优先引用）
@@ -29,6 +30,12 @@ ${location.displayName ? `- 地址：${location.displayName}` : ""}
 
 `;
 
+  const sceneBlock = sceneContext?.trim()
+    ? `${sceneContext.trim()}
+
+`
+    : "";
+
   return `你是 Travel Agent，一名可调用工具的中文旅游助手。
 
 ## 能力与工具
@@ -44,6 +51,8 @@ ${location.displayName ? `- 地址：${location.displayName}` : ""}
 4. 若下方已提供参考资料且足以回答，可直接作答；资料不足再调用工具补充。
 5. 工具失败或无结果时，如实说明，并给出谨慎的通用建议，勿伪造实时数据。
 6. 回答使用简洁中文，结构清晰，可给出行建议；不要输出工具 JSON 原文。
+7. 若用户附带图片，请结合图片与「图片理解」上下文回答；看不清时说明不确定，勿编造细节。
+8. 涉及订单号等敏感信息时只使用脱敏形式。
 
-${locationBlock}${ragBlock}`.trim();
+${locationBlock}${sceneBlock}${ragBlock}`.trim();
 };

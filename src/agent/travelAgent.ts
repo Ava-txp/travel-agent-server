@@ -8,6 +8,7 @@ import {
   ToolMessage,
   type BaseMessage,
 } from "langchain";
+import type { ChatSceneHint } from "../db/chatStore.js";
 import {
   formatChunksForPrompt,
   retrieveKnowledge,
@@ -16,6 +17,11 @@ import {
   buildTravelAgentSystemPrompt,
   type LocationContext,
 } from "./prompts.js";
+import {
+  buildMultimodalHumanMessage,
+  buildSceneHintContext,
+  runScenePipeline,
+} from "./scenes.js";
 import {
   createTravelTools,
   reverseGeocode,
@@ -45,6 +51,11 @@ export type TravelAgentChatParams = {
   dryTools?: boolean;
   /** 前端浏览器定位 */
   location?: UserLocationInput | null;
+  /** 本轮图片 data URL（Vision） */
+  imageDataUrls?: string[];
+  sceneHint?: ChatSceneHint | null;
+  /** 有图时用于分类/抽取的 Vision 模型；缺省则复用主 LLM */
+  visionLlm?: ChatOpenAI | null;
 };
 
 export type TravelAgentChatResult =
@@ -100,6 +111,9 @@ export class TravelAgent {
       signal,
       dryTools = process.env.EVAL_DRY_TOOLS === "1",
       location = null,
+      imageDataUrls = [],
+      sceneHint = null,
+      visionLlm = null,
     } = params;
 
     let fullText = "";
@@ -136,12 +150,42 @@ export class TravelAgent {
         }
       }
 
+      let sceneContext: string | null = null;
+      const vision = visionLlm ?? this.llm;
+
+      if (imageDataUrls.length > 0) {
+        // 默认跳过「分类+抽取」两次额外 Vision 调用，直接把原图交给 VL 回答。
+        // 需要结构化管线时设置 ENABLE_SCENE_PIPELINE=1。
+        if (process.env.ENABLE_SCENE_PIPELINE === "1") {
+          const pipeline = await runScenePipeline({
+            visionLlm: vision,
+            imageDataUrls,
+            message,
+            sceneHint,
+            signal,
+          });
+          sceneContext = pipeline.contextBlock;
+          toolTrace.push(`scene:${pipeline.scene}`);
+          console.log(
+            `[TravelAgent] scene pipeline => ${pipeline.scene}`,
+            pipeline.extract,
+          );
+        } else {
+          sceneContext = buildSceneHintContext(sceneHint);
+          toolTrace.push(`sceneHint:${sceneHint || "none"}`);
+        }
+      }
+
+      const ragQuery =
+        message.trim() ||
+        sceneContext?.slice(0, 200) ||
+        "旅游图片咨询";
       const cityHint =
         extractCityHint(
-          `${message} ${history.map((h) => h.content).join(" ")}`,
+          `${message} ${history.map((h) => h.content).join(" ")} ${sceneContext || ""}`,
         ) || locationContext?.city;
       const ragChunks = retrieveKnowledge({
-        query: message,
+        query: ragQuery,
         city: cityHint,
         topK: 3,
       });
@@ -153,12 +197,64 @@ export class TravelAgent {
           : new HumanMessage(item.content),
       );
 
+      const userText =
+        message.trim() ||
+        (imageDataUrls.length > 0
+          ? "请结合我上传的图片给出旅游相关建议。"
+          : "");
+
+      /**
+       * 有图时的回答策略：
+       * - 默认把原图交给 Vision 模型流式回答（主模型 Kimi 等纯文本看不到图）
+       * - 仅当 FORCE_TEXT_CHAT_WITH_IMAGES=1 时，退回主模型 + 文本上下文
+       */
+      const preferVisionAnswer =
+        imageDataUrls.length > 0 &&
+        process.env.FORCE_TEXT_CHAT_WITH_IMAGES !== "1";
+
+      if (preferVisionAnswer) {
+        console.log("[TravelAgent] answering with vision model + images");
+        const visionMessages: BaseMessage[] = [
+          new SystemMessage(
+            buildTravelAgentSystemPrompt(
+              ragContext,
+              locationContext,
+              sceneContext,
+            ) +
+              `\n\n你可以直接查看用户上传的图片。请基于图片内容回答，不要说「无法查看图片」。`,
+          ),
+          ...historyMessages,
+          buildMultimodalHumanMessage(userText, imageDataUrls),
+        ];
+
+        const stream = await vision.stream(visionMessages, { signal });
+        for await (const chunk of stream) {
+          if (signal?.aborted) break;
+          const text = toTextContent(chunk.content);
+          if (text) {
+            fullText += text;
+            streamCallback(text);
+          }
+        }
+
+        return {
+          success: true,
+          aborted: Boolean(signal?.aborted),
+          response: fullText,
+          toolTrace,
+        };
+      }
+
       const messages: BaseMessage[] = [
         new SystemMessage(
-          buildTravelAgentSystemPrompt(ragContext, locationContext),
+          buildTravelAgentSystemPrompt(
+            ragContext,
+            locationContext,
+            sceneContext,
+          ),
         ),
         ...historyMessages,
-        new HumanMessage(message),
+        new HumanMessage(userText),
       ];
 
       const tools = createTravelTools(toolOptions);

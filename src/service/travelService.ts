@@ -1,6 +1,7 @@
 import { ChatOpenAI } from "@langchain/openai";
 import type { MessageContent } from "@langchain/core/messages";
 import { HumanMessage, SystemMessage } from "langchain";
+import type { ChatSceneHint } from "../db/chatStore.js";
 import {
   TravelAgent,
   type ChatHistoryItem,
@@ -20,14 +21,18 @@ export type ChatParams = {
   dryTools?: boolean;
   /** 前端浏览器定位 */
   location?: UserLocationInput | null;
+  imageDataUrls?: string[];
+  sceneHint?: ChatSceneHint | null;
 };
 
 class TravelService {
   private llm: ChatOpenAI;
+  private visionLlm: ChatOpenAI;
   private agent: TravelAgent;
 
   constructor() {
     this.llm = this.initLLM();
+    this.visionLlm = this.initVisionLLM();
     this.agent = new TravelAgent(this.llm);
   }
 
@@ -61,6 +66,41 @@ class TravelService {
       },
       configuration: {
         baseURL, // 兼容 OpenAI 协议的接口地址（如硅基流动）
+      },
+    });
+  }
+
+  /**
+   * Vision 模型：优先 `${PROVIDER}_VISION_MODEL`，否则回退主模型。
+   */
+  initVisionLLM() {
+    const provider = process.env.MODEL_PROVIDER;
+    if (!provider) {
+      throw new Error("MODEL_PROVIDER is not set");
+    }
+
+    const apiKey = process.env[`${provider}_API_KEY`];
+    const baseURL = process.env[`${provider}_BASE_URL`];
+    const visionModel =
+      process.env[`${provider}_VISION_MODEL`] ||
+      process.env.VISION_MODEL ||
+      process.env[`${provider}_MODEL`];
+
+    if (!apiKey || !baseURL || !visionModel) {
+      throw new Error(`Missing Vision LLM config for provider: ${provider}`);
+    }
+
+    console.log("initVisionLLM......", visionModel);
+
+    return new ChatOpenAI({
+      apiKey,
+      model: visionModel,
+      temperature: 0.2,
+      // 有图时最终回答也走 vision.stream
+      streaming: true,
+      // 注意：Qwen3-VL 等视觉模型不支持 enable_thinking，勿写入 modelKwargs
+      configuration: {
+        baseURL,
       },
     });
   }
@@ -261,7 +301,10 @@ class TravelService {
    * 传入 signal 后，客户端断开可取消上游大模型请求。
    */
   async chat(params: ChatParams) {
-    return this.agent.chat(params);
+    return this.agent.chat({
+      ...params,
+      visionLlm: this.visionLlm,
+    });
   }
 }
 

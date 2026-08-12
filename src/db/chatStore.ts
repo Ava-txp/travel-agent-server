@@ -3,7 +3,11 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+import type { ChatAttachment } from "./uploadStore.js";
+
 export type ChatRole = "user" | "assistant";
+
+export type ChatSceneHint = "spot_sign" | "ticket_itinerary" | "food_menu";
 
 /** 会话归属：登录用户优先 userId，否则匿名 clientId */
 export type ConversationOwner = {
@@ -27,6 +31,8 @@ export interface MessageRow {
   role: ChatRole;
   content: string;
   created_at: number;
+  attachments?: ChatAttachment[];
+  sceneHint?: ChatSceneHint;
 }
 
 export interface ConversationSummary {
@@ -47,8 +53,15 @@ export interface ConversationDetail {
     role: ChatRole;
     content: string;
     createdAt: number;
+    attachments?: ChatAttachment[];
+    sceneHint?: ChatSceneHint;
   }[];
 }
+
+export type AddMessageOptions = {
+  attachments?: ChatAttachment[];
+  sceneHint?: ChatSceneHint;
+};
 
 const MAX_HISTORY_MESSAGES = 20;
 const TITLE_MAX_LEN = 20;
@@ -103,12 +116,72 @@ if (!conversationColumns.some((col) => col.name === "user_id")) {
   db.exec(`ALTER TABLE conversations ADD COLUMN user_id TEXT`);
 }
 
+const messageColumns = db
+  .prepare(`PRAGMA table_info(messages)`)
+  .all() as { name: string }[];
+
+if (!messageColumns.some((col) => col.name === "attachments_json")) {
+  db.exec(`ALTER TABLE messages ADD COLUMN attachments_json TEXT`);
+}
+
+if (!messageColumns.some((col) => col.name === "scene_hint")) {
+  db.exec(`ALTER TABLE messages ADD COLUMN scene_hint TEXT`);
+}
+
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_conversations_client_pinned_updated
     ON conversations(client_id, pinned DESC, updated_at DESC);
   CREATE INDEX IF NOT EXISTS idx_conversations_user_pinned_updated
     ON conversations(user_id, pinned DESC, updated_at DESC);
 `);
+
+const parseAttachmentsJson = (
+  raw: string | null | undefined,
+): ChatAttachment[] | undefined => {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed) || parsed.length === 0) return undefined;
+    return parsed as ChatAttachment[];
+  } catch {
+    return undefined;
+  }
+};
+
+const parseSceneHint = (
+  raw: string | null | undefined,
+): ChatSceneHint | undefined => {
+  if (
+    raw === "spot_sign" ||
+    raw === "ticket_itinerary" ||
+    raw === "food_menu"
+  ) {
+    return raw;
+  }
+  return undefined;
+};
+
+const mapMessageRow = (row: {
+  id: string;
+  conversation_id: string;
+  role: ChatRole;
+  content: string;
+  created_at: number;
+  attachments_json?: string | null;
+  scene_hint?: string | null;
+}): MessageRow => {
+  const attachments = parseAttachmentsJson(row.attachments_json);
+  const sceneHint = parseSceneHint(row.scene_hint);
+  return {
+    id: row.id,
+    conversation_id: row.conversation_id,
+    role: row.role,
+    content: row.content,
+    created_at: row.created_at,
+    ...(attachments ? { attachments } : {}),
+    ...(sceneHint ? { sceneHint } : {}),
+  };
+};
 
 const now = () => Date.now();
 
@@ -192,7 +265,12 @@ export const listConversations = (
          c.updated_at AS updatedAt,
          COALESCE(
            (
-             SELECT m.content
+             SELECT CASE
+               WHEN TRIM(m.content) != '' THEN m.content
+               WHEN m.attachments_json IS NOT NULL AND m.attachments_json != '' AND m.attachments_json != '[]'
+                 THEN '[图片]'
+               ELSE ''
+             END
              FROM messages m
              WHERE m.conversation_id = c.id
              ORDER BY m.created_at DESC
@@ -285,14 +363,29 @@ export const addMessage = (
   conversationId: string,
   role: ChatRole,
   content: string,
+  options?: AddMessageOptions,
 ): MessageRow => {
   const id = randomUUID();
   const ts = now();
+  const attachments = options?.attachments?.length
+    ? options.attachments
+    : undefined;
+  const sceneHint = options?.sceneHint;
+  const attachmentsJson = attachments ? JSON.stringify(attachments) : null;
 
   db.prepare(
-    `INSERT INTO messages (id, conversation_id, role, content, created_at)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(id, conversationId, role, content, ts);
+    `INSERT INTO messages
+      (id, conversation_id, role, content, created_at, attachments_json, scene_hint)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    conversationId,
+    role,
+    content,
+    ts,
+    attachmentsJson,
+    sceneHint ?? null,
+  );
 
   return {
     id,
@@ -300,18 +393,30 @@ export const addMessage = (
     role,
     content,
     created_at: ts,
+    ...(attachments ? { attachments } : {}),
+    ...(sceneHint ? { sceneHint } : {}),
   };
 };
 
 export const listMessages = (conversationId: string): MessageRow[] => {
-  return db
+  const rows = db
     .prepare(
-      `SELECT id, conversation_id, role, content, created_at
+      `SELECT id, conversation_id, role, content, created_at, attachments_json, scene_hint
        FROM messages
        WHERE conversation_id = ?
        ORDER BY created_at ASC`,
     )
-    .all(conversationId) as MessageRow[];
+    .all(conversationId) as Array<{
+    id: string;
+    conversation_id: string;
+    role: ChatRole;
+    content: string;
+    created_at: number;
+    attachments_json?: string | null;
+    scene_hint?: string | null;
+  }>;
+
+  return rows.map(mapMessageRow);
 };
 
 export const listRecentMessages = (
@@ -320,15 +425,23 @@ export const listRecentMessages = (
 ): MessageRow[] => {
   const rows = db
     .prepare(
-      `SELECT id, conversation_id, role, content, created_at
+      `SELECT id, conversation_id, role, content, created_at, attachments_json, scene_hint
        FROM messages
        WHERE conversation_id = ?
        ORDER BY created_at DESC
        LIMIT ?`,
     )
-    .all(conversationId, limit) as MessageRow[];
+    .all(conversationId, limit) as Array<{
+    id: string;
+    conversation_id: string;
+    role: ChatRole;
+    content: string;
+    created_at: number;
+    attachments_json?: string | null;
+    scene_hint?: string | null;
+  }>;
 
-  return rows.reverse();
+  return rows.reverse().map(mapMessageRow);
 };
 
 export const touchConversation = (
@@ -369,6 +482,8 @@ export const getConversationDetail = (
     role: m.role,
     content: m.content,
     createdAt: m.created_at,
+    ...(m.attachments?.length ? { attachments: m.attachments } : {}),
+    ...(m.sceneHint ? { sceneHint: m.sceneHint } : {}),
   }));
 
   return {

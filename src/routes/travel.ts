@@ -1,13 +1,29 @@
 import { Router, type Response } from "express";
+import multer from "multer";
+import { imageSize } from "image-size";
 import travelService from "../service/travelService.js";
 import { createStreamResponse } from "../utils/streamUtils.js";
 import * as chatStore from "../db/chatStore.js";
-import type { ConversationOwner } from "../db/chatStore.js";
+import type { ChatSceneHint, ConversationOwner } from "../db/chatStore.js";
 import * as planStore from "../db/planStore.js";
+import * as uploadStore from "../db/uploadStore.js";
+import { sceneHintTitle } from "../agent/scenes.js";
 import { reverseGeocode } from "../agent/tools.js";
 import { optionalAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const router = Router();
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: uploadStore.MAX_UPLOAD_BYTES, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    if (uploadStore.ALLOWED_IMAGE_MIMES.has(file.mimetype.toLowerCase())) {
+      cb(null, true);
+      return;
+    }
+    cb(new Error("仅支持 JPEG / PNG / WebP 图片"));
+  },
+});
 
 const requireClientId = (req: AuthedRequest, res: Response): string | null => {
   const clientId = req.header("X-Client-Id")?.trim();
@@ -31,6 +47,17 @@ const resolveOwner = (
     clientId,
     userId: req.user?.id ?? null,
   };
+};
+
+const parseSceneHint = (value: unknown): ChatSceneHint | null => {
+  if (
+    value === "spot_sign" ||
+    value === "ticket_itinerary" ||
+    value === "food_menu"
+  ) {
+    return value;
+  }
+  return null;
 };
 
 router.post("/recommend", optionalAuth, async (req: AuthedRequest, res) => {
@@ -92,21 +119,161 @@ router.post("/recommend", optionalAuth, async (req: AuthedRequest, res) => {
   }
 });
 
+/** 上传聊天图片：multipart field = file */
+router.post(
+  "/uploads/image",
+  optionalAuth,
+  (req: AuthedRequest, res, next) => {
+    upload.single("file")(req, res, (err: unknown) => {
+      if (!err) {
+        next();
+        return;
+      }
+      const message =
+        err instanceof Error ? err.message : "上传失败";
+      const isSize =
+        typeof err === "object" &&
+        err !== null &&
+        "code" in err &&
+        (err as { code?: string }).code === "LIMIT_FILE_SIZE";
+      res.status(400).json({
+        status: "error",
+        message: isSize ? "图片过大，最大 5MB" : message,
+      });
+    });
+  },
+  (req: AuthedRequest, res) => {
+    const owner = resolveOwner(req, res);
+    if (!owner) return;
+
+    const file = req.file;
+    if (!file?.buffer?.length) {
+      return res.status(400).json({
+        status: "error",
+        message: "Missing file field: file",
+      });
+    }
+
+    try {
+      let width: number | undefined;
+      let height: number | undefined;
+      try {
+        const dim = imageSize(file.buffer);
+        if (dim.width) width = dim.width;
+        if (dim.height) height = dim.height;
+      } catch {
+        // 尺寸解析失败不阻断上传
+      }
+
+      const saved = uploadStore.saveUpload({
+        owner,
+        buffer: file.buffer,
+        mime: file.mimetype,
+        width,
+        height,
+      });
+
+      return res.status(200).json({
+        status: "ok",
+        data: {
+          id: saved.id,
+          url: saved.url,
+          mime: saved.mime,
+          width: saved.width,
+          height: saved.height,
+        },
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "图片上传失败";
+      return res.status(400).json({
+        status: "error",
+        message,
+      });
+    }
+  },
+);
+
+/** 读取已上传图片（供 H5 展示；UUID 不透明） */
+router.get("/uploads/files/:id", (req, res) => {
+  const id = String(req.params.id || "");
+  const row = uploadStore.getUploadById(id);
+  if (!row) {
+    return res.status(404).json({
+      status: "error",
+      message: "File not found",
+    });
+  }
+
+  const filePath = uploadStore.absoluteUploadPath(row.filename);
+  res.setHeader("Content-Type", row.mime);
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  return res.sendFile(filePath);
+});
+
 router.post("/chat", optionalAuth, async (req: AuthedRequest, res) => {
   const owner = resolveOwner(req, res);
   if (!owner) return;
 
-  const { message, conversationId, location } = (req.body ?? {}) as {
-    message?: string;
-    conversationId?: string;
-    location?: {
-      lat?: unknown;
-      lon?: unknown;
-      accuracy?: unknown;
-      city?: unknown;
-      displayName?: unknown;
+  const { message, conversationId, location, attachments, sceneHint } =
+    (req.body ?? {}) as {
+      message?: string;
+      conversationId?: string;
+      location?: {
+        lat?: unknown;
+        lon?: unknown;
+        accuracy?: unknown;
+        city?: unknown;
+        displayName?: unknown;
+      };
+      attachments?: Array<{ id?: unknown; type?: unknown }>;
+      sceneHint?: unknown;
     };
-  };
+
+  const text = typeof message === "string" ? message.trim() : "";
+  const parsedSceneHint = parseSceneHint(sceneHint);
+
+  const attachmentIds = Array.isArray(attachments)
+    ? attachments
+        .filter(
+          (item) =>
+            item &&
+            typeof item.id === "string" &&
+            item.id.trim() &&
+            (item.type === undefined || item.type === "image"),
+        )
+        .map((item) => String(item.id).trim())
+        .slice(0, 3)
+    : [];
+
+  if (!text && attachmentIds.length === 0) {
+    return res.status(400).json({
+      status: "error",
+      message: "Missing required field: message or attachments",
+    });
+  }
+
+  const resolvedAttachments: uploadStore.ChatAttachment[] = [];
+  const imageDataUrls: string[] = [];
+  for (const id of attachmentIds) {
+    const row = uploadStore.getOwnedUpload(id, owner);
+    if (!row) {
+      return res.status(400).json({
+        status: "error",
+        message: `Invalid attachment: ${id}`,
+      });
+    }
+    resolvedAttachments.push(uploadStore.toChatAttachment(row));
+    try {
+      imageDataUrls.push(uploadStore.readUploadAsDataUrl(row));
+    } catch (error) {
+      console.error("read upload failed", id, error);
+      return res.status(500).json({
+        status: "error",
+        message: "Failed to read attachment",
+      });
+    }
+  }
 
   const parsedLocation =
     location &&
@@ -132,21 +299,18 @@ router.post("/chat", optionalAuth, async (req: AuthedRequest, res) => {
 
   console.log(
     "message",
-    message,
+    text,
     "conversationId",
     conversationId,
     "userId",
     owner.userId,
     "location",
     parsedLocation,
+    "attachments",
+    resolvedAttachments.map((a) => a.id),
+    "sceneHint",
+    parsedSceneHint,
   );
-
-  if (!message?.trim()) {
-    return res.status(400).json({
-      status: "error",
-      message: "Missing required field: message",
-    });
-  }
 
   let conversation = conversationId
     ? chatStore.getConversation(conversationId, owner)
@@ -159,35 +323,39 @@ router.post("/chat", optionalAuth, async (req: AuthedRequest, res) => {
     });
   }
 
+  const fallbackTitle = text
+    ? chatStore.truncateTitle(text)
+    : sceneHintTitle(parsedSceneHint);
+
   if (!conversation) {
-    conversation = chatStore.createConversation(
-      owner,
-      chatStore.truncateTitle(message),
-    );
+    conversation = chatStore.createConversation(owner, fallbackTitle);
   }
 
   const existingMessages = chatStore.listMessages(conversation.id);
   const isFirstUserMessage = existingMessages.length === 0;
-  chatStore.addMessage(conversation.id, "user", message);
+  chatStore.addMessage(conversation.id, "user", text, {
+    attachments: resolvedAttachments.length
+      ? resolvedAttachments
+      : undefined,
+    sceneHint: parsedSceneHint ?? undefined,
+  });
 
   if (isFirstUserMessage) {
-    chatStore.touchConversation(
-      conversation.id,
-      owner,
-      chatStore.truncateTitle(message),
-    );
+    chatStore.touchConversation(conversation.id, owner, fallbackTitle);
 
-    const conversationIdForTitle = conversation.id;
-    const firstUserMessage = message;
-    void (async () => {
-      const summary = await travelService.summarizeTitle(firstUserMessage);
-      if (!summary) return;
-      chatStore.touchConversation(
-        conversationIdForTitle,
-        owner,
-        chatStore.truncateTitle(summary),
-      );
-    })();
+    if (text) {
+      const conversationIdForTitle = conversation.id;
+      const firstUserMessage = text;
+      void (async () => {
+        const summary = await travelService.summarizeTitle(firstUserMessage);
+        if (!summary) return;
+        chatStore.touchConversation(
+          conversationIdForTitle,
+          owner,
+          chatStore.truncateTitle(summary),
+        );
+      })();
+    }
   } else {
     chatStore.touchConversation(conversation.id, owner);
   }
@@ -221,12 +389,16 @@ router.post("/chat", optionalAuth, async (req: AuthedRequest, res) => {
 
   try {
     const result = await travelService.chat({
-      message,
+      message: text,
       history: historyForLlm.map((m) => ({
         role: m.role,
-        content: m.content,
+        content:
+          m.content ||
+          (m.attachments?.length ? "[用户上传了图片]" : ""),
       })),
       location: parsedLocation,
+      imageDataUrls,
+      sceneHint: parsedSceneHint,
       streamCallback: (chunk) => {
         if (abortController.signal.aborted || res.writableEnded) return;
         stream.writeChunk(chunk);

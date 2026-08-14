@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import travelRouter from "./routes/travel.js";
 import authRouter from "./routes/auth.js";
+import { errorHandler } from "./middleware/errorHandler.js";
 
 const app = express();
 const PORT = Number(process.env.PORT) || 5000;
@@ -28,6 +29,9 @@ app.get("/api/heartbeat", (_req, res) => {
 
 app.use("/api/auth", authRouter);
 app.use("/api/travel", travelRouter);
+
+// 必须挂在所有路由之后，否则捕获不到它们抛出的错误
+app.use(errorHandler);
 
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);

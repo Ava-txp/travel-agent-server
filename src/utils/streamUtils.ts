@@ -1,12 +1,26 @@
 import type { Response } from "express";
 
-export type StreamEventType = "chunk" | "done" | "error";
+export type StreamEventType =
+  | "chunk"
+  | "done"
+  | "error"
+  | "stage"
+  | "meta"
+  | "day"
+  | "budget";
 
 export interface StreamEvent<T = unknown> {
   type: StreamEventType;
   content?: T;
   message?: string;
+  code?: string;
+  retryAfter?: number;
 }
+
+export type StreamErrorExtra = {
+  code?: string;
+  retryAfter?: number;
+};
 
 export interface StreamWriter {
   /** 发送一段增量内容 */
@@ -16,7 +30,7 @@ export interface StreamWriter {
   /** 发送完成事件并关闭连接 */
   end: <T = unknown>(data?: T) => void;
   /** 发送错误事件并关闭连接 */
-  error: (message: string) => void;
+  error: (message: string, extra?: StreamErrorExtra) => void;
 }
 
 /**
@@ -60,8 +74,8 @@ export const createStreamResponse = (res: Response): StreamWriter => {
         res.end();
       }
     },
-    error: (message: string) => {
-      send({ type: "error", message });
+    error: (message: string, extra?: StreamErrorExtra) => {
+      send({ type: "error", message, ...extra });
       if (!res.writableEnded) {
         res.end();
       }

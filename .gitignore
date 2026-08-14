@@ -1,6 +1,9 @@
 node_modules/
 dist/
-data/
+# 运行时数据；知识库需纳入版本库以便 Docker / CI
+data/*
+!data/knowledge/
+!data/knowledge/**
 .env
 .DS_Store
 npm-debug.log*

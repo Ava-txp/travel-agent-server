@@ -1,17 +1,20 @@
 /**
  * 认证相关路由：注册、登录、获取当前用户、登出。
  *
- * 账号支持手机号或邮箱；登录成功后签发 JWT（见 middleware/auth）。
+ * 账号支持手机号或邮箱；登录成功后签发 JWT（见 utils/jwt）。
  * 若请求携带 clientId，会把匿名会话/行程合并到正式用户名下。
+ *
+ * 意外错误一律抛出，由 middleware/errorHandler 统一转成 500。
  */
 import { Router, type Response } from "express";
 import bcrypt from "bcryptjs";
 import {
   optionalAuth,
   requireAuth,
-  signAccessToken,
   type AuthedRequest,
 } from "../middleware/auth.js";
+import { asyncHandler } from "../middleware/errorHandler.js";
+import { signAccessToken } from "../utils/jwt.js";
 import * as userStore from "../db/userStore.js";
 import * as chatStore from "../db/chatStore.js";
 import * as planStore from "../db/planStore.js";
@@ -120,8 +123,9 @@ const issueAuthResponse = (
  * - nickname：可选，最长 20；缺省用 defaultNickname
  * - clientId：可选，用于合并匿名数据
  */
-router.post("/register", (req, res) => {
-  try {
+router.post(
+  "/register",
+  asyncHandler((req, res) => {
     const {
       account: accountRaw,
       password: passwordRaw,
@@ -165,22 +169,17 @@ router.post("/register", (req, res) => {
       typeof clientIdRaw === "string" ? clientIdRaw.trim() : undefined;
 
     return issueAuthResponse(res, user, clientId || undefined);
-  } catch (error) {
-    console.error("register failed:", error);
-    return res.status(500).json({
-      status: "error",
-      message: "注册失败，请稍后重试",
-    });
-  }
-});
+  }),
+);
 
 /**
  * POST /login
  * Body: { account, password, clientId? }
  * 校验通过后同样走 issueAuthResponse（含匿名数据合并）。
  */
-router.post("/login", (req, res) => {
-  try {
+router.post(
+  "/login",
+  asyncHandler((req, res) => {
     const {
       account: accountRaw,
       password: passwordRaw,
@@ -228,14 +227,8 @@ router.post("/login", (req, res) => {
       typeof clientIdRaw === "string" ? clientIdRaw.trim() : undefined;
 
     return issueAuthResponse(res, user, clientId || undefined);
-  } catch (error) {
-    console.error("login failed:", error);
-    return res.status(500).json({
-      status: "error",
-      message: "登录失败，请稍后重试",
-    });
-  }
-});
+  }),
+);
 
 /**
  * GET /me
@@ -243,16 +236,20 @@ router.post("/login", (req, res) => {
  * requireAuth: 验签、失败返 401、成功把身份挂到 req.user
  * 根据 JWT 中的用户 id 返回公开资料；用户已删则 401。
  */
-router.get("/me", requireAuth, (req: AuthedRequest, res) => {
-  const user = userStore.getPublicUserById(req.user!.id);
-  if (!user) {
-    return res.status(401).json({
-      status: "error",
-      message: "用户不存在",
-    });
-  }
-  return res.status(200).json({ status: "ok", data: user });
-});
+router.get(
+  "/me",
+  requireAuth,
+  asyncHandler((req: AuthedRequest, res) => {
+    const user = userStore.getPublicUserById(req.user!.id);
+    if (!user) {
+      return res.status(401).json({
+        status: "error",
+        message: "用户不存在",
+      });
+    }
+    return res.status(200).json({ status: "ok", data: user });
+  }),
+);
 
 /**
  * POST /logout

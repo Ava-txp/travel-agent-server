@@ -3,6 +3,7 @@ import multer from "multer";
 import { imageSize } from "image-size";
 import travelService from "../service/travelService.js";
 import { createStreamResponse } from "../utils/streamUtils.js";
+import { prepareChatContext } from "../utils/contextWindow.js";
 import * as chatStore from "../db/chatStore.js";
 import type { ChatSceneHint, ConversationOwner } from "../db/chatStore.js";
 import * as planStore from "../db/planStore.js";
@@ -10,6 +11,7 @@ import * as uploadStore from "../db/uploadStore.js";
 import { sceneHintTitle } from "../agent/scenes.js";
 import { reverseGeocode } from "../agent/tools.js";
 import { optionalAuth, type AuthedRequest } from "../middleware/auth.js";
+import { handleRecommendStream } from "./recommend.js";
 
 const router = Router();
 
@@ -60,64 +62,7 @@ const parseSceneHint = (value: unknown): ChatSceneHint | null => {
   return null;
 };
 
-router.post("/recommend", optionalAuth, async (req: AuthedRequest, res) => {
-  try {
-    const { city, budget, days } = req.body || {};
-
-    if (!city || !budget || !days) {
-      return res.status(400).json({
-        status: "error",
-        message: "Missing required fields",
-      });
-    }
-
-    const result = await travelService.recommend(city, budget, days);
-    console.log("准备返回给客户端的数据", result);
-
-    // 规划成功后落库，便于「规划记录」查询
-    let data: unknown = result;
-    const isSuccess =
-      result &&
-      typeof result === "object" &&
-      (result as { success?: unknown }).success !== false;
-
-    if (isSuccess) {
-      const clientId = req.header("X-Client-Id")?.trim();
-      if (clientId) {
-        try {
-          const planResult = result as {
-            city?: string;
-            days?: number;
-            totalBudget?: number;
-          };
-          const saved = planStore.createPlan(
-            { clientId, userId: req.user?.id ?? null },
-            {
-              city: planResult.city || String(city),
-              days: Number(planResult.days) || Number(days),
-              totalBudget:
-                Number(planResult.totalBudget) || Number(budget),
-              content: result,
-            },
-          );
-          data = { ...(result as object), id: saved.id };
-        } catch (saveError) {
-          console.error("保存规划记录失败", saveError);
-        }
-      }
-    }
-
-    return res.status(200).json({
-      status: "ok",
-      data,
-    });
-  } catch {
-    return res.status(500).json({
-      status: "error",
-      message: "Internal server error",
-    });
-  }
-});
+router.post("/recommend", optionalAuth, handleRecommendStream);
 
 /** 上传聊天图片：multipart field = file */
 router.post(
@@ -360,14 +305,27 @@ router.post("/chat", optionalAuth, async (req: AuthedRequest, res) => {
     chatStore.touchConversation(conversation.id, owner);
   }
 
+  // 先取较宽的候选历史（条数上限），再按 token 预算做滑动窗口 / 摘要压缩
   const recent = chatStore.listRecentMessages(
     conversation.id,
-    chatStore.MAX_CHAT_HISTORY,
+    Math.max(chatStore.MAX_CHAT_HISTORY, 40),
   );
-  const historyForLlm =
+  const historyRaw =
     recent.length > 0 && recent[recent.length - 1]?.role === "user"
       ? recent.slice(0, -1)
       : recent;
+  const historyMapped = historyRaw.map((m) => ({
+    role: m.role,
+    content:
+      m.content || (m.attachments?.length ? "[用户上传了图片]" : ""),
+  }));
+
+  const { history: historyForLlm, stats: contextStats } =
+    await prepareChatContext({
+      history: historyMapped,
+      currentMessage: text,
+      summarizeFn: (dropped) => travelService.summarizeHistory(dropped),
+    });
 
   const stream = createStreamResponse(res);
   const abortController = new AbortController();
@@ -390,12 +348,7 @@ router.post("/chat", optionalAuth, async (req: AuthedRequest, res) => {
   try {
     const result = await travelService.chat({
       message: text,
-      history: historyForLlm.map((m) => ({
-        role: m.role,
-        content:
-          m.content ||
-          (m.attachments?.length ? "[用户上传了图片]" : ""),
-      })),
+      history: historyForLlm,
       location: parsedLocation,
       imageDataUrls,
       sceneHint: parsedSceneHint,
@@ -431,6 +384,14 @@ router.post("/chat", optionalAuth, async (req: AuthedRequest, res) => {
     stream.end({
       conversationId: conversationIdForDone,
       content: result.response,
+      usage: {
+        estimatedInputTokens: contextStats.estimatedTotalInputTokens,
+        historyBeforeTokens: contextStats.historyBeforeTokens,
+        historyAfterTokens: contextStats.historyAfterTokens,
+        keptMessages: contextStats.keptMessages,
+        droppedMessages: contextStats.droppedMessages,
+        summarized: contextStats.summarized,
+      },
     });
   } catch (error) {
     if (abortController.signal.aborted || res.writableEnded) {

@@ -8,6 +8,13 @@ import {
   type ChatStreamCallback,
   type UserLocationInput,
 } from "../agent/travelAgent.js";
+import { isRateLimitError } from "../utils/llmErrors.js";
+import { extractJsonBlock, parsePlanJson } from "../utils/planJson.js";
+import { getTravelPrompt } from "./recommendPrompt.js";
+import {
+  runRecommendStream,
+  type RecommendStreamParams,
+} from "./recommendStream.js";
 
 /** 流式对话：每收到一段文本就回调一次 */
 export type { ChatStreamCallback, ChatHistoryItem, UserLocationInput };
@@ -127,28 +134,18 @@ class TravelService {
       /**
        * ========== 【part 2】大模型调用 ===========
        */
-      // 1、获取提示词数据
-      const messages = this.getTravelPrompt(city, budget, days);
+      const messages = getTravelPrompt(city, budget, days);
 
       console.log("获取提示词数据完成");
-      // 2、调用 LLM 模型
       const response = await this.llm.invoke(messages);
       console.log("response", response);
-      // 3、处理大模型返回结果
       try {
-        // 3-1、大模型的原始数据
         const originContent = response.content as string;
-
-        // 3-2、（systemPrompt已经要求了 JSON 格式）正则匹配筛选出 JSON 格式的数据
-        const jsonContent = this.getJsonContent(originContent);
-
-        // 3-3、如果筛选不出 JSON 格式的数据，则抛出错误
+        const jsonContent = extractJsonBlock(originContent);
         if (!jsonContent) {
           throw new Error("Invalid JSON content");
         }
-        const parsedContent = JSON.parse(jsonContent?.[1]);
-
-        return parsedContent;
+        return parsePlanJson(jsonContent);
       } catch (parseError) {
         return {
           success: false,
@@ -157,6 +154,7 @@ class TravelService {
         };
       }
     } catch (error) {
+      if (isRateLimitError(error)) throw error;
       return {
         success: false,
         message: error instanceof Error ? error.message : error,
@@ -164,80 +162,8 @@ class TravelService {
     }
   }
 
-  getTravelPrompt(city: string, budget: number, days: number) {
-    const systemPrompt = `
-你是一个专业的旅游规划师，擅长根据用户的需求生成详细的旅行行程。
-要求：
-1. 每天的行程安排（上午、下午、晚上）
-2. 每个景点的详细介绍
-3. 交通建议
-4. 预算分配明细
-5. 注意事项
-
-请以JSON格式输出，结构如下：
-{
-  "success": true,
-  "city": "城市名",
-  "days": 天数,
-  "totalBudget": 总预算,
-  "dailyItinerary": [
-    {
-      "day": 1,
-      "date": "第1天",
-      "morning": {
-        "spot": "景点名称",
-        "duration": "游览时长",
-        "ticket": "门票价格",
-        "transportation": "交通方式",
-        "description": "景点介绍"
-      },
-      "afternoon": {
-        "spot": "景点名称",
-        "duration": "游览时长",
-        "ticket": "门票价格",
-        "transportation": "交通方式",
-        "description": "景点介绍"
-      },
-      "evening": {
-        "spot": "活动名称",
-        "duration": "活动时长",
-        "ticket": "费用",
-        "transportation": "交通方式",
-        "description": "活动介绍"
-      }
-    }
-  ],
-  "budgetBreakdown": {
-    "accommodation": 住宿费用,
-    "food": 餐饮费用,
-    "transportation": 交通费用,
-    "tickets": 门票费用,
-    "other": 其他费用
-  },
-  "tips": ["提示1", "提示2", "提示3"],
-  "warnings": ["注意事项1", "注意事项2"]
-}
-
-请确保JSON格式正确，可以被解析。`;
-
-    const humanPrompt = `请根据以下信息为用户生成一份详细的旅游规划：
-- 目的地城市：${city}
-- 预算：${budget}元
-- 旅行天数：${days}天`;
-
-    /**
-     * HumanMessage 会把这段文本标记为 role: "user"
-     * SystemMessage 会把这段文本标记为 role: "system"
-     */
-    return [new SystemMessage(systemPrompt), new HumanMessage(humanPrompt)];
-  }
-
-  getJsonContent(content: string) {
-    return (
-      content.match(/```json\n([\s\S]*?)\n```/) ||
-      content.match(/```\n([\s\S]*?)\n```/) ||
-      content.match(/\{[\s\S]*\}/)
-    );
+  recommendStream(params: Omit<RecommendStreamParams, "llm">) {
+    return runRecommendStream({ ...params, llm: this.llm });
   }
 
   /**
@@ -292,6 +218,40 @@ class TravelService {
       return text || null;
     } catch (error) {
       console.error("summarizeTitle failed:", error);
+      return null;
+    }
+  }
+
+  /**
+   * 将滑出上下文窗口的旧消息压缩成短摘要，供后续轮次作为前置记忆。
+   */
+  async summarizeHistory(
+    messages: Array<{ role: "user" | "assistant"; content: string }>,
+  ): Promise<string | null> {
+    const transcript = messages
+      .map((m) => `${m.role === "user" ? "用户" : "助手"}: ${m.content.trim()}`)
+      .filter((line) => line.length > 4)
+      .join("\n")
+      .slice(0, 6_000);
+
+    if (!transcript.trim()) return null;
+
+    try {
+      const response = await this.llm.invoke([
+        new SystemMessage(
+          `你是对话记忆压缩器。请把以下早期对话压缩成简洁中文摘要，供后续轮次继续使用。
+要求：
+1. 保留目的地、天数、预算、已确认偏好、未完成待办与关键事实
+2. 不要编造原文没有的信息
+3. 控制在 200 字以内，只输出摘要正文`,
+        ),
+        new HumanMessage(transcript),
+      ]);
+
+      const text = this.toTextContent(response.content).trim();
+      return text || null;
+    } catch (error) {
+      console.error("summarizeHistory failed:", error);
       return null;
     }
   }

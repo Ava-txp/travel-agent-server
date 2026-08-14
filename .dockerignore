@@ -1,0 +1,8 @@
+node_modules
+npm-debug.log*
+dist
+.env
+data/chat.db*
+data/plans.db*
+data/uploads
+.DS_Store

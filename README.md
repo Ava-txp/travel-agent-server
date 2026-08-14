@@ -230,3 +230,23 @@ Authorization: Bearer <token>
 
 知识库文档位于 `data/knowledge/`（Markdown + frontmatter：`city` / `type` / `tags`）。
 
+## 上下文窗口（Token 预算）
+
+对话在进入 Agent 前会走 `prepareChatContext`：
+
+1. **启发式 Token 估算**（中英混合，见 `src/utils/tokenCounter.ts`）
+2. **滑动窗口**：从最新消息向前填满输入预算
+3. **摘要压缩**（默认开启）：被滑出的旧消息经 LLM 压成短摘要再注入
+
+相关环境变量见 `.env.example`（`CONTEXT_MAX_TOKENS` 等）。SSE `done` 事件的 `content.usage` 会带回估算统计。
+
+## Docker
+
+仓库根目录：
+
+```bash
+docker compose up -d --build
+```
+
+镜像与 Nginx SSE 反代说明见根目录 `README.md`。
+

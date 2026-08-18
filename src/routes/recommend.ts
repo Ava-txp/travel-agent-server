@@ -2,18 +2,12 @@ import type { Response } from "express";
 import travelService from "../service/travelService.js";
 import { RecommendStreamError } from "../service/recommendStream.js";
 import type { AuthedRequest } from "../middleware/auth.js";
-import {
-  isRateLimitError,
-  readRetryAfterSec,
-} from "../utils/llmErrors.js";
+import { isRateLimitError, readRetryAfterSec } from "../utils/llmErrors.js";
 import { createStreamResponse } from "../utils/streamUtils.js";
 
 const HEARTBEAT_MS = 3000;
 
-export async function handleRecommendStream(
-  req: AuthedRequest,
-  res: Response,
-) {
+export async function handleRecommendStream(req: AuthedRequest, res: Response) {
   const { city, budget, days } = req.body || {};
 
   if (!city || !budget || !days) {
@@ -38,9 +32,7 @@ export async function handleRecommendStream(
   }, HEARTBEAT_MS);
 
   const clientId = req.header("X-Client-Id")?.trim();
-  const owner = clientId
-    ? { clientId, userId: req.user?.id ?? null }
-    : null;
+  const owner = clientId ? { clientId, userId: req.user?.id ?? null } : null;
 
   try {
     await travelService.recommendStream({

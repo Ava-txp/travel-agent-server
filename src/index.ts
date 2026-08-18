@@ -13,7 +13,15 @@ if (!process.env.JWT_SECRET?.trim()) {
   );
 }
 
+/**
+ * 解析 Content-Type: application/json 的请求
+ * body 会变成普通对象挂到 req.body 上
+ */
 app.use(express.json());
+/**
+ * 解析 Content-Type: application/x-www-form-urlencoded 的请求
+ * body 会变成普通对象挂到 req.body 上
+ */
 app.use(express.urlencoded({ extended: true }));
 
 app.get("/", (_, res) => {

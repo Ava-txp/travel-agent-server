@@ -28,17 +28,18 @@ src/
   agent/         # TravelAgent、工具、场景识别、系统提示词
   db/            # SQLite：用户 / 会话 / 规划 / 上传
   rag/           # 本地知识库检索
-  routes/        # auth、travel API
-  service/       # 业务编排与 LLM 初始化
-  middleware/    # JWT 鉴权
-  utils/         # SSE 流式响应
+  routes/        # auth、travel、recommend（流式规划）
+  service/       # 业务编排、LLM、recommendStream
+  middleware/    # JWT 鉴权、统一 errorHandler
+  utils/         # SSE、上下文窗口、plan JSON 解析、LLM 错误
   index.ts       # 入口
 data/
   knowledge/     # RAG 文档（按城市 Markdown）
-  uploads/       # 上传图片
-  *.db           # SQLite 数据文件
+  uploads/       # 上传图片（运行时）
+  *.db           # SQLite 数据文件（运行时）
 evals/           # Agent 评测用例
 scripts/         # 评测脚本
+Dockerfile       # 多阶段构建；entrypoint 首次 seed 知识库
 ```
 
 ## 流程图
@@ -148,6 +149,7 @@ npm install
 可选：
 
 - `ATTACH_IMAGES_TO_CHAT=1`：最终对话轮把原图一并发给主模型（主模型需支持视觉）
+- `ENABLE_SCENE_PIPELINE=1`：有图时先跑 Vision「分类 + 抽取」；默认关闭，直接把原图交给 Vision 模型回答
 
 ### 3. 启动
 
@@ -193,8 +195,8 @@ Authorization: Bearer <token>
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `POST` | `/recommend` | 行程推荐（body: `city`, `budget`, `days`） |
-| `POST` | `/chat` | 流式对话（`message`、`conversationId`、`location`、`attachments`、`sceneHint`） |
+| `POST` | `/recommend` | **SSE** 行程规划（body: `city`, `budget`, `days`） |
+| `POST` | `/chat` | **SSE** 流式对话（`message`、`conversationId`、`location`、`attachments`、`sceneHint`） |
 | `GET` | `/conversations` | 会话列表 |
 | `POST` | `/conversations` | 新建会话 |
 | `GET` | `/conversations/:id` | 会话详情（含消息） |
@@ -207,6 +209,31 @@ Authorization: Bearer <token>
 | `GET` | `/uploads/files/:id` | 读取已上传图片 |
 | `GET` | `/location/reverse` | 逆地理编码（query: `lat`, `lon`） |
 
+#### 约束
+
+| 接口 | 约束 |
+|------|------|
+| `/recommend` | `days` 1–30；`budget` ≥ 100；缺字段返回 400 JSON（非 SSE） |
+| `/chat` | `message` 与 `attachments` 至少其一；附件最多 3 张，且须属当前 owner |
+| `/uploads/image` | JPEG / PNG / WebP；单文件 ≤ 5MB |
+
+#### SSE 约定
+
+两条流式接口均返回 `Content-Type: text/event-stream`，每条事件一行 `data: <json>\n\n`（见 `src/utils/streamUtils.ts`）。设置了 `X-Accel-Buffering: no` 以便反代实时推送。客户端断开时会 `AbortController.abort()` 取消 LLM。
+
+**`POST /recommend` 事件**（实现：`src/routes/recommend.ts` + `recommendStream.ts`）：
+
+| `type` | 含义 |
+|--------|------|
+| `stage` | 心跳 / 阶段，内容多为 `"generating"`（约每 3s） |
+| `meta` | 部分解析出的 `{ city, days, totalBudget }` |
+| `day` | 某一天行程（按 day 号去重推送） |
+| `budget` | 预算拆分 |
+| `done` | 完整规划 JSON；若带了 `X-Client-Id` 会落库并带上 `id` |
+| `error` | 失败；可能含 `code`（如 `RATE_LIMITED`、`PARSE_FAILED`）与 `retryAfter` |
+
+**`POST /chat` 事件**：`chunk`（增量文本）→ `done`（含 `conversationId`、完整 `content`、上下文 `usage`）或 `error`。
+
 #### 对话场景 Hint
 
 `sceneHint` 可选值：
@@ -215,7 +242,7 @@ Authorization: Bearer <token>
 - `ticket_itinerary` — 门票 / 行程单
 - `food_menu` — 菜单
 
-有图时走 Vision 分类与结构化抽取，再注入对话上下文。
+默认有图时把原图交给 Vision 模型直答；仅当 `ENABLE_SCENE_PIPELINE=1` 时才走「分类 + 结构化抽取」再注入上下文。
 
 ## Agent 与工具
 
@@ -242,11 +269,30 @@ Authorization: Bearer <token>
 
 ## Docker
 
-仓库根目录：
+本仓库仅含后端镜像（无 `docker-compose.yml`）。知识库在镜像内作为 `knowledge-seed`；命名卷首次挂载空的 `/app/data/knowledge` 时，`docker-entrypoint.sh` 会拷贝 seed。
 
 ```bash
-docker compose up -d --build
+# 构建
+docker build -t travel-server .
+
+# 运行（持久化 SQLite / 上传 / 知识库）
+docker run --rm -p 5000:5000 \
+  --env-file .env \
+  -v travel-server-data:/app/data \
+  travel-server
 ```
 
-镜像与 Nginx SSE 反代说明见根目录 `README.md`。
+健康检查探测 `GET /api/heartbeat`。与前端联调时：H5 镜像的 Nginx 把 `/api/` 反代到主机名 `server:5000`（见 `travel-agent-H5` 的 `nginx.conf`），Compose 中请把本服务命名为 `server`，并为 SSE 关闭缓冲、拉长超时。
+
+## 故障排查
+
+| 现象 | 排查 |
+|------|------|
+| 注册 / 登录 500 或不可用 | 未设置 `JWT_SECRET`（启动时会打 warn） |
+| `/recommend` 立刻 400 JSON | 缺 `city` / `budget` / `days`，尚未进入 SSE |
+| 规划 `RATE_LIMITED` | 上游 LLM 限流；事件带 `retryAfter`，前端会倒计时重试 |
+| 规划 `PARSE_FAILED` | 模型输出非预期 JSON；重试或检查主模型是否适合结构化输出 |
+| 对话无场景抽取 | 默认未开管线；需要时设 `ENABLE_SCENE_PIPELINE=1` 且配置可用的 Vision 模型 |
+| Docker 知识库为空 | 确认 volume 首次为空从而触发 seed；或手动挂载 `data/knowledge` |
+| better-sqlite3 本地编译失败 | 需本机 Python / make / g++；Docker 构建已在 builder 阶段安装 |
 

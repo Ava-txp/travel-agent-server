@@ -164,8 +164,26 @@ npm start            # 生产：node dist/index.js
 ### 4. 评测
 
 ```bash
-npm run eval         # EVAL_DRY_TOOLS=1，工具打桩、无需外网
+npm run eval              # 默认 EVAL_DRY_TOOLS=1：工具打桩，无需外网天气/地理 API
+EVAL_DRY_TOOLS=0 npm run eval   # 真实调用工具（需外网）
 ```
+
+- 用例：`evals/travel-agent.eval.json`（期望工具、关键词、是否要求 RAG 命中）
+- 脚本：`scripts/run-eval.ts` → 调 `travelService.chat`，汇总 pass/fail
+- 仍需要可用的主模型配置（`.env` 中 `MODEL_PROVIDER` / API Key 等）
+
+## 数据归属（Owner）
+
+旅行域多数 REST / 上传 / 对话接口经 `optionalAuth` + `resolveOwner`（`src/routes/travel.ts`）：
+
+| 请求头 | 作用 |
+|--------|------|
+| `X-Client-Id`（必填） | 匿名设备标识；缺则 400 |
+| `Authorization: Bearer`（可选） | 合法 JWT 时 `userId` 写入 owner |
+
+查询规则（`chatStore` / `planStore` / `uploadStore`）：**有 `userId` 按用户查；否则按 `clientId` 且 `user_id IS NULL`**。登录/注册若 body 带 `clientId`，会把该匿名会话与规划 `UPDATE` 到正式 `user_id`（返回 `mergedConversations` / `mergedPlans`）。
+
+例外：`POST /recommend` 不强制 `X-Client-Id`；有则落库并在 `done` 带 `id`，无则只流式返回不持久化。
 
 ## API 一览
 
@@ -180,10 +198,12 @@ npm run eval         # EVAL_DRY_TOOLS=1，工具打桩、无需外网
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `POST` | `/register` | 注册（手机号或邮箱，密码 ≥ 6 位） |
-| `POST` | `/login` | 登录，返回 JWT；可带 `clientId` 合并匿名数据 |
+| `POST` | `/register` | 注册；body: `account`, `password`, 可选 `nickname` / `clientId` |
+| `POST` | `/login` | 登录；可带 `clientId` 合并匿名数据 |
 | `GET` | `/me` | 当前用户（需 Bearer Token） |
-| `POST` | `/logout` | 登出（客户端丢弃 Token 即可） |
+| `POST` | `/logout` | 登出（服务端无状态；客户端丢弃 Token 即可） |
+
+约束：`account` 为大陆手机号（`1` + 10 位）或邮箱；邮箱存小写；密码 ≥ 6 位；未设 `JWT_SECRET` 时鉴权路由不可用。
 
 ### 旅行 `/api/travel`
 
@@ -255,7 +275,30 @@ Authorization: Bearer <token>
 | `search_attractions` | 景点检索（结合本地知识库） |
 | `search_travel_guides` | 攻略检索（结合本地知识库） |
 
-知识库文档位于 `data/knowledge/`（Markdown + frontmatter：`city` / `type` / `tags`）。
+## 知识库（RAG）
+
+路径：`data/knowledge/*.md`。启动时（及 Docker entrypoint seed 后）按文件加载；按 `##` 二级标题切成 chunk，进程内缓存（改文件后需重启或 `loadKnowledgeChunks(true)`）。
+
+Frontmatter 示例：
+
+```markdown
+---
+city: 北京
+type: both          # attraction | guide | both
+tags: 故宫,长城,颐和园
+---
+
+# 北京旅游攻略
+
+## 必去景点：故宫博物院
+...
+## 游玩攻略与交通
+...
+```
+
+- `type: both` 时，标题含「景点|必去」偏 attraction，「攻略|交通|美食|住宿|游玩」偏 guide
+- 检索：中英 token + 城市软过滤；工具与 system RAG 注入共用（见 `src/rag/knowledgeBase.ts`）
+- 新增城市：在该目录加 Markdown → 本地重启；Docker 需更新镜像或挂载覆盖 volume（空 volume 仅首次从 seed 拷贝）
 
 ## 上下文窗口（Token 预算）
 

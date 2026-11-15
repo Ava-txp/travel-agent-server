@@ -248,11 +248,90 @@ Authorization: Bearer <token>
 | `stage` | 心跳 / 阶段，内容多为 `"generating"`（约每 3s） |
 | `meta` | 部分解析出的 `{ city, days, totalBudget }` |
 | `day` | 某一天行程（按 day 号去重推送） |
-| `budget` | 预算拆分 |
+| `budget` | 预算拆分（`budgetBreakdown` 对象） |
 | `done` | 完整规划 JSON；若带了 `X-Client-Id` 会落库并带上 `id` |
 | `error` | 失败；可能含 `code`（如 `RATE_LIMITED`、`PARSE_FAILED`）与 `retryAfter` |
 
-**`POST /chat` 事件**：`chunk`（增量文本）→ `done`（含 `conversationId`、完整 `content`、上下文 `usage`）或 `error`。
+增量推送条件（`planPartialParse.ts`）：`day` 须同时具备 `day` 数字与 `morning` / `afternoon` / `evening`（且各段 `spot` 非空）才发出；`budget` 在 `budgetBreakdown` 对象完整闭合后发出一次。
+
+**规划 JSON 字段**（提示词约定：`recommendPrompt.ts`；H5 类型：`TravelPlan`）：
+
+```json
+{
+  "success": true,
+  "city": "城市名",
+  "days": 3,
+  "totalBudget": 3000,
+  "dailyItinerary": [
+    {
+      "day": 1,
+      "date": "第1天",
+      "morning": {
+        "spot": "景点名",
+        "duration": "游览时长",
+        "ticket": "门票",
+        "transportation": "交通",
+        "description": "介绍"
+      },
+      "afternoon": { "...": "同上" },
+      "evening": { "...": "同上" }
+    }
+  ],
+  "budgetBreakdown": {
+    "accommodation": 0,
+    "food": 0,
+    "transportation": 0,
+    "tickets": 0,
+    "other": 0
+  },
+  "tips": ["..."],
+  "warnings": ["..."]
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `success` | `false` 时 SSE 以 `PARSE_FAILED` 结束，消息取 `message` |
+| `dailyItinerary[].day` | 按 day 号去重；前端 `mergePlanEvent` 按同号覆盖 |
+| `budgetBreakdown` | 五类费用数字；对应 SSE `budget` 事件的 `content` |
+| `id` | 仅持久化后出现在 `done`（有 `X-Client-Id` 时） |
+
+**`POST /chat` 事件**：
+
+| `type` | 载荷 |
+|--------|------|
+| `chunk` | `content`: 增量文本 |
+| `done` | `content`: `{ conversationId, content, usage }` |
+| `error` | `message`（字符串） |
+
+`done.content.usage`（启发式估算，见 `prepareChatContext` / `tokenCounter.ts`）：
+
+| 字段 | 含义 |
+|------|------|
+| `estimatedInputTokens` | 本轮估算输入总量（含当前消息） |
+| `historyBeforeTokens` | 压缩 / 滑动前历史 token |
+| `historyAfterTokens` | 压缩 / 滑动后送入 Agent 的历史 token |
+| `keptMessages` | 保留的历史条数 |
+| `droppedMessages` | 滑出窗口的条数 |
+| `summarized` | 是否对滑出消息做了摘要压缩 |
+
+H5 当前消费 `conversationId` / `content`，不展示 `usage`；字段仍可用于排障与评测。
+
+#### 常见 API 错误（REST，非 SSE）
+
+| 场景 | HTTP | `message` 示例 |
+|------|------|----------------|
+| 缺 `X-Client-Id` | 400 | `Missing required header: X-Client-Id` |
+| `/recommend` 缺字段 | 400 | `Missing required fields`（JSON，未进 SSE） |
+| `/chat` 无文无图 | 400 | `Missing required field: message or attachments` |
+| 附件非本人 / 不存在 | 400 | `Invalid attachment: <id>`（`getOwnedUpload`） |
+| 附件文件读失败 | 500 | `Failed to read attachment` |
+| 上传缺 `file` | 400 | `Missing file field: file` |
+| MIME 非 JPEG/PNG/WebP | 400 | `仅支持 JPEG / PNG / WebP 图片` |
+| 上传 > 5MB | 400 | `图片过大，最大 5MB` |
+| 读上传文件 404 | 404 | `File not found`（`GET /uploads/files/:id` 无鉴权，靠 UUID 不透明） |
+
+归属：登录用户按 `user_id`；匿名按 `client_id` 且 `user_id IS NULL`。登录后引用登录前匿名上传的 id 会 `Invalid attachment`。
 
 #### 对话场景 Hint
 

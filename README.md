@@ -150,6 +150,7 @@ npm install
 
 - `ATTACH_IMAGES_TO_CHAT=1`：最终对话轮把原图一并发给主模型（主模型需支持视觉）
 - `ENABLE_SCENE_PIPELINE=1`：有图时先跑 Vision「分类 + 抽取」；默认关闭，直接把原图交给 Vision 模型回答
+- `NOMINATIM_USER_AGENT`：Nominatim 回退请求的 User-Agent（默认 `travel-recommend-h5/1.0`）
 
 ### 3. 启动
 
@@ -236,6 +237,68 @@ Authorization: Bearer <token>
 | `/recommend` | `days` 1–30；`budget` ≥ 100；缺字段返回 400 JSON（非 SSE） |
 | `/chat` | `message` 与 `attachments` 至少其一；附件最多 3 张，且须属当前 owner |
 | `/uploads/image` | JPEG / PNG / WebP；单文件 ≤ 5MB |
+| `/location/reverse` | query `lat`/`lon` 须为有限数字；纬度 ∈ [-90,90]，经度 ∈ [-180,180] |
+| `/conversations` PATCH | body 至少含 `title`（string）或 `pinned`（boolean）之一 |
+
+#### 会话列表与 PATCH
+
+`GET /conversations` 返回当前 owner 的摘要列表，SQL 排序：`pinned DESC, updated_at DESC`。每项含：
+
+| 字段 | 说明 |
+|------|------|
+| `id` / `title` / `pinned` | 会话标识、标题、是否置顶 |
+| `updatedAt` | 毫秒时间戳 |
+| `preview` | 最近一条消息：非空文本，否则有附件显示 `[图片]`，否则 `""` |
+
+`PATCH /conversations/:id`（`src/routes/travel.ts` + `chatStore`）：
+
+| 字段 | 类型 | 行为 |
+|------|------|------|
+| `title` | string | trim + 压缩空白；空串 → 400 `Title cannot be empty`；截断至 **40** 字（尾部 `…`） |
+| `pinned` | boolean | `true`/`false` 写入 `pinned` 列（1/0）；不更新 `updated_at` |
+
+两者都缺 → 400 `Nothing to update`；会话不存在 → 404。成功响应：
+
+```json
+{ "status": "ok", "data": { "id": "...", "title": "...", "pinned": true, "updatedAt": 0 } }
+```
+
+说明：首轮自动生成标题走 `truncateTitle` 默认上限 **20** 字；手动重命名上限 **40** 字。`POST /conversations` 默认标题为「新对话」，响应不含 `pinned`（恒为未置顶）。
+
+#### 逆地理编码 `GET /location/reverse`
+
+实现：`reverseGeocode`（`src/agent/tools.ts`）。需 `X-Client-Id`。
+
+成功 `200`：
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "lat": 39.9042,
+    "lon": 116.4074,
+    "city": "北京",
+    "displayName": "..."
+  }
+}
+```
+
+| 步骤 | 说明 |
+|------|------|
+| 主路径 | BigDataCloud `reverse-geocode-client`，`localityLanguage=zh` |
+| 回退 | Nominatim `/reverse`（`zoom=10`，User-Agent 见 `NOMINATIM_USER_AGENT`） |
+| 城市归一 | 去掉「市/地区/特别行政区」后缀；若干繁体字转简体；空则 `"当前位置"` |
+| 超时 | 外网请求统一 `8000ms`（`FETCH_TIMEOUT_MS`） |
+| 评测 | `dryTools` 时返回固定「模拟城市」，不打外网 |
+
+错误：
+
+| HTTP | 条件 |
+|------|------|
+| 400 | 缺/非法 `lat`/`lon`，或越界 |
+| 502 | 主路径与 Nominatim 均失败；`message` 多为主路径错误文案 |
+
+国内常见：Nominatim 超时或不可达——属预期，主路径应优先成功；两者都失败时前端应降级为仅用经纬度。
 
 #### SSE 约定
 
@@ -330,6 +393,11 @@ H5 当前消费 `conversationId` / `content`，不展示 `usage`；字段仍可�
 | MIME 非 JPEG/PNG/WebP | 400 | `仅支持 JPEG / PNG / WebP 图片` |
 | 上传 > 5MB | 400 | `图片过大，最大 5MB` |
 | 读上传文件 404 | 404 | `File not found`（`GET /uploads/files/:id` 无鉴权，靠 UUID 不透明） |
+| 逆地理缺/非法坐标 | 400 | `Missing or invalid query: lat, lon` / `lat/lon out of range` |
+| 逆地理上游失败 | 502 | 外网超时或供应商错误原文 |
+| PATCH 无有效字段 | 400 | `Nothing to update` |
+| PATCH 空标题 | 400 | `Title cannot be empty` |
+| 会话 / 规划不存在 | 404 | `Conversation not found` / `Plan not found` |
 
 归属：登录用户按 `user_id`；匿名按 `client_id` 且 `user_id IS NULL`。登录后引用登录前匿名上传的 id 会 `Invalid attachment`。
 
@@ -345,14 +413,16 @@ H5 当前消费 `conversationId` / `content`，不展示 `usage`；字段仍可�
 
 ## Agent 与工具
 
-对话由 `TravelAgent` 编排，最多多轮工具调用，内置工具包括：
+对话由 `TravelAgent` 编排（`createTravelTools`），工具结果统一为 JSON 字符串：`{ ok: true, data }` 或 `{ ok: false, tool, error }`。`EVAL_DRY_TOOLS=1` / `dryTools` 时天气与地理走桩数据。
 
-| 工具 | 作用 |
-|------|------|
-| `get_weather` | 查询天气 |
-| `geocode_location` | 地理编码 |
-| `search_attractions` | 景点检索（结合本地知识库） |
-| `search_travel_guides` | 攻略检索（结合本地知识库） |
+| 工具 | 参数（Zod） | 行为要点 |
+|------|-------------|----------|
+| `get_weather` | `city?` string；`lat?`/`lon?` number；`days?` int 1–7（默认 3） | 缺坐标时用 `geocodePlace(city)`；只有坐标时反查城市名。数据源 Open-Meteo；返回 `current` + `daily[]`（气温/天气码文案/降水） |
+| `geocode_location` | `query` string（必填） | 地名 → `{ lat, lon, displayName }`。优先 Open-Meteo，失败回退 Nominatim |
+| `search_attractions` | `city` string；`keyword?` string | 本地 RAG，`type=attraction`，`topK=4`；无命中带 `note` |
+| `search_travel_guides` | `query` string；`city?` string | 本地 RAG，`type=guide`，`topK=4`；另含 `resultsText` 便于拼进提示词 |
+
+地理编码策略与 HTTP 逆地理互补：正向编码偏 Open-Meteo；逆地理偏 BigDataCloud。外网超时均为 8s。
 
 ## 知识库（RAG）
 
@@ -415,6 +485,9 @@ docker run --rm -p 5000:5000 \
 | 规划 `RATE_LIMITED` | 上游 LLM 限流；事件带 `retryAfter`，前端会倒计时重试 |
 | 规划 `PARSE_FAILED` | 模型输出非预期 JSON；重试或检查主模型是否适合结构化输出 |
 | 对话无场景抽取 | 默认未开管线；需要时设 `ENABLE_SCENE_PIPELINE=1` 且配置可用的 Vision 模型 |
+| `/location/reverse` 502 | BigDataCloud 与 Nominatim 均失败；查出站网络 / 超时（8s）；Nominatim 可用 `NOMINATIM_USER_AGENT` |
+| 会话 PATCH 400 | 确认 body 有 `title` 字符串或 `pinned` 布尔；标题勿全空白 |
+| 列表排序不符合预期 | 服务端按置顶优先再按 `updated_at`；置顶本身不刷新 `updated_at` |
 | Docker 知识库为空 | 确认 volume 首次为空从而触发 seed；或手动挂载 `data/knowledge` |
 | better-sqlite3 本地编译失败 | 需本机 Python / make / g++；Docker 构建已在 builder 阶段安装 |
 

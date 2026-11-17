@@ -300,6 +300,39 @@ Authorization: Bearer <token>
 
 国内常见：Nominatim 超时或不可达——属预期，主路径应优先成功；两者都失败时前端应降级为仅用经纬度。
 
+#### 对话请求体 `location`（`POST /chat`）
+
+可选字段；仅当 `lat`/`lon` 均为有限 `number` 时生效，否则整段忽略（不报错）。实现：`routes/travel.ts` → `TravelAgent`。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `lat` / `lon` | number | 必填（否则丢弃 `location`） |
+| `accuracy` | number? | 浏览器精度（米）；有限数字才保留 |
+| `city` / `displayName` | string? | 非空 trim 后注入；可由前端逆地理预填 |
+
+服务端软失败路径（`travelAgent.ts`）：若只有坐标、没有 `city`，会再调一次 `reverseGeocode`；失败只 `console.warn`，仍用裸坐标继续对话（天气工具等可凭 lat/lon 工作）。前端反查失败同理——可只传坐标。
+
+#### 规划记录 REST
+
+落库：`recommendStream.persistPlan` 在 SSE `done` 且有 owner（`X-Client-Id`）时调用 `planStore.createPlan`；失败只打日志，流式结果仍返回（可能无 `id`）。
+
+| 方法 | 路径 | 成功形状 |
+|------|------|----------|
+| `GET` | `/plans` | `{ status:"ok", data: PlanSummary[] }`，按 `updated_at DESC` |
+| `GET` | `/plans/:id` | `{ status:"ok", data: PlanDetail }`；无权限/不存在 → 404 `Plan not found` |
+| `DELETE` | `/plans/:id` | `{ status:"ok", data: { id } }`；未删到 → 404 |
+
+`PlanSummary`（`planStore.ts`）：
+
+| 字段 | 说明 |
+|------|------|
+| `id` | UUID |
+| `city` / `days` / `totalBudget` | 创建时写入；城市空串归一为「未知城市」 |
+| `title` | 派生：`{city}行程规划 · {days}天`（非独立列） |
+| `createdAt` / `updatedAt` | 毫秒时间戳 |
+
+`PlanDetail` = `PlanSummary` + `plan`（`content` JSON 解析后的完整规划对象；解析失败则为 `{}`）。归属规则与会话相同：有 `userId` 按用户，否则 `client_id` 且 `user_id IS NULL`。
+
 #### SSE 约定
 
 两条流式接口均返回 `Content-Type: text/event-stream`，每条事件一行 `data: <json>\n\n`（见 `src/utils/streamUtils.ts`）。设置了 `X-Accel-Buffering: no` 以便反代实时推送。客户端断开时会 `AbortController.abort()` 取消 LLM。
@@ -401,15 +434,35 @@ H5 当前消费 `conversationId` / `content`，不展示 `usage`；字段仍可�
 
 归属：登录用户按 `user_id`；匿名按 `client_id` 且 `user_id IS NULL`。登录后引用登录前匿名上传的 id 会 `Invalid attachment`。
 
-#### 对话场景 Hint
+#### 对话场景 Hint 与 Vision 管线
 
-`sceneHint` 可选值：
+`sceneHint` 可选值（前端软提示，后端可纠正）：
 
 - `spot_sign` — 景点指示牌
 - `ticket_itinerary` — 门票 / 行程单
 - `food_menu` — 菜单
 
-默认有图时把原图交给 Vision 模型直答；仅当 `ENABLE_SCENE_PIPELINE=1` 时才走「分类 + 结构化抽取」再注入上下文。
+默认有图时把原图交给 Vision 模型直答；仅当 `ENABLE_SCENE_PIPELINE=1` 时才走「分类 + 结构化抽取」再注入上下文（`scenes.ts` → `runScenePipeline`）。关闭管线时仍可用 `buildSceneHintContext(sceneHint)` 注入回答大纲。
+
+管线步骤：`classifyScene` → 按场景 `extract*` → `contextBlock` 写入 system prompt。分类失败或无图时回退 `sceneHint ?? "unknown"`。
+
+**分类 JSON**（模型只应输出）：
+
+```json
+{ "scene": "spot_sign|ticket_itinerary|food_menu|unknown", "confidence": 0.0 }
+```
+
+规则：`confidence` clamp 到 `[0,1]`；若 hint 与分类冲突且分类置信度 `< 0.55`，或分类为 `unknown` 且有 hint，则采纳 hint。
+
+**抽取 JSON**（按场景）：
+
+| 场景 | 关键字段 |
+|------|----------|
+| `spot_sign` | `placeName` / `placeType` / `visibleText` / `confidence` |
+| `ticket_itinerary` | `kind`（`ticket\|itinerary\|mixed\|unknown`）、`title`、`spots[]`、`startDate`/`endDate`、`visitTime`、`ticketType`、`price`、`orderNo`、`notes[]`、`confidence` |
+| `food_menu` | `items[{name,price?,category?}]`（最多 30）、`avgPriceMin`/`avgPriceMax`、`confidence` |
+
+对外上下文中订单号经 `maskOrderNo` 脱敏（只留后 4 位）。菜单场景会用 `parseBudgetFromText` 从用户本轮文字抽「人均 / 两人 / 预算」金额，写入回答大纲。抽取失败返回低置信度空结构，不中断对话。
 
 ## Agent 与工具
 
@@ -484,8 +537,11 @@ docker run --rm -p 5000:5000 \
 | `/recommend` 立刻 400 JSON | 缺 `city` / `budget` / `days`，尚未进入 SSE |
 | 规划 `RATE_LIMITED` | 上游 LLM 限流；事件带 `retryAfter`，前端会倒计时重试 |
 | 规划 `PARSE_FAILED` | 模型输出非预期 JSON；重试或检查主模型是否适合结构化输出 |
-| 对话无场景抽取 | 默认未开管线；需要时设 `ENABLE_SCENE_PIPELINE=1` 且配置可用的 Vision 模型 |
+| 对话无场景抽取 | 默认未开管线；需要时设 `ENABLE_SCENE_PIPELINE=1` 且配置可用的 Vision 模型（`SILICONFLOW_VISION_MODEL`） |
+| 管线分类总回退 unknown | 看 Vision 日志 `[scenes] classifyScene failed`；确认 VL 模型可用且返回 JSON |
 | `/location/reverse` 502 | BigDataCloud 与 Nominatim 均失败；查出站网络 / 超时（8s）；Nominatim 可用 `NOMINATIM_USER_AGENT` |
+| chat 有坐标无城市 | 前端反查失败或未传 `city`；服务端二次逆地理也会 soft-fail，对话仍继续 |
+| 规划列表空但刚生成过 | `done` 无 `id`：缺 `X-Client-Id` 或 `persistPlan` 落库异常（看服务端日志） |
 | 会话 PATCH 400 | 确认 body 有 `title` 字符串或 `pinned` 布尔；标题勿全空白 |
 | 列表排序不符合预期 | 服务端按置顶优先再按 `updated_at`；置顶本身不刷新 `updated_at` |
 | Docker 知识库为空 | 确认 volume 首次为空从而触发 seed；或手动挂载 `data/knowledge` |

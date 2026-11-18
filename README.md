@@ -169,9 +169,21 @@ npm run eval              # 默认 EVAL_DRY_TOOLS=1：工具打桩，无需外�
 EVAL_DRY_TOOLS=0 npm run eval   # 真实调用工具（需外网）
 ```
 
-- 用例：`evals/travel-agent.eval.json`（期望工具、关键词、是否要求 RAG 命中）
-- 脚本：`scripts/run-eval.ts` → 调 `travelService.chat`，汇总 pass/fail
+- 用例：`evals/travel-agent.eval.json`
+- 脚本：`scripts/run-eval.ts` → 调 `travelService.chat`，汇总 pass/fail；任一例失败则 `exitCode=1`
 - 仍需要可用的主模型配置（`.env` 中 `MODEL_PROVIDER` / API Key 等）
+- `EVAL_DRY_TOOLS`：未设或非 `0` 时工具打桩；仅 `EVAL_DRY_TOOLS=0` 走真实外网工具
+
+用例字段（`EvalCase`）：
+
+| 字段 | 含义 |
+|------|------|
+| `id` / `query` | 用例名与用户问题 |
+| `expectTools` | 必须全部出现在 `toolTrace`；`[]` 表示期望尽量无工具（软约束，除非另有 `forbidTools`） |
+| `expectToolsAny` | 至少命中其一；若同时 `acceptRagWithoutTools` 且 RAG 有命中，可豁免 |
+| `forbidTools` | 出现即失败 |
+| `expectKeywordsAny` | 回答文本至少命中一个关键词 |
+| `requireRag` | 为 `true` 时 `retrieveKnowledge(query, topK=3)` 必须有命中 |
 
 ## 数据归属（Owner）
 
@@ -204,7 +216,34 @@ EVAL_DRY_TOOLS=0 npm run eval   # 真实调用工具（需外网）
 | `GET` | `/me` | 当前用户（需 Bearer Token） |
 | `POST` | `/logout` | 登出（服务端无状态；客户端丢弃 Token 即可） |
 
-约束：`account` 为大陆手机号（`1` + 10 位）或邮箱；邮箱存小写；密码 ≥ 6 位；未设 `JWT_SECRET` 时鉴权路由不可用。
+约束：`account` 为大陆手机号（`1` + 10 位）或邮箱；邮箱存小写；密码 ≥ 6 位；昵称可选、最长 20（缺省按手机后四位或邮箱前缀生成）；未设 `JWT_SECRET` 时鉴权路由不可用。Body 解析支持 `application/json` 与 `application/x-www-form-urlencoded`（见 `src/index.ts`）。
+
+`POST /register` / `POST /login` 成功（`issueAuthResponse`，HTTP 200）：
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "token": "<jwt>",
+    "user": { "id": "...", "account": "...", "nickname": "...", "createdAt": 0 },
+    "mergedConversations": 0,
+    "mergedPlans": 0
+  }
+}
+```
+
+有 `clientId` 时先 `mergeAnonymousConversations` / `mergeAnonymousPlans`，再签发 JWT；两计数字段为本次合并条数（无 `clientId` 则为 `0`）。`user` 不含密码哈希。
+
+| 场景 | HTTP | `message` |
+|------|------|-----------|
+| 账号非法（注册） | 400 | `请输入有效的手机号或邮箱` |
+| 密码 < 6（注册） | 400 | `密码至少 6 位` |
+| 账号或密码格式不对（登录） | 400 | `账号或密码格式不正确` |
+| 账号已存在 | 409 | `该账号已注册` |
+| 账号不存在或密码错 | 401 | `账号或密码错误`（同一文案，防枚举） |
+| `/me` 用户已删 | 401 | `用户不存在` |
+
+`GET /me` 成功：`{ status: "ok", data: { id, account, nickname, createdAt } }`。`POST /logout`：`{ status: "ok" }`（`optionalAuth`，不强制登录）。
 
 ### 旅行 `/api/travel`
 
@@ -236,9 +275,12 @@ Authorization: Bearer <token>
 |------|------|
 | `/recommend` | `days` 1–30；`budget` ≥ 100；缺字段返回 400 JSON（非 SSE） |
 | `/chat` | `message` 与 `attachments` 至少其一；附件最多 3 张，且须属当前 owner |
-| `/uploads/image` | JPEG / PNG / WebP；单文件 ≤ 5MB |
+| `/uploads/image` | JPEG / PNG / WebP；单文件 ≤ 5MB；multipart field 名必须为 `file` |
+| `/uploads/files/:id` | **无鉴权**；靠 UUID 不透明；按库内 `mime` 设 `Content-Type`；`Cache-Control: public, max-age=31536000, immutable` |
 | `/location/reverse` | query `lat`/`lon` 须为有限数字；纬度 ∈ [-90,90]，经度 ∈ [-180,180] |
 | `/conversations` PATCH | body 至少含 `title`（string）或 `pinned`（boolean）之一 |
+
+`POST /uploads/image` 成功：`{ status: "ok", data: { id, url, mime, width?, height? } }`，其中 `url` 形如 `/api/travel/uploads/files/<id>`。尺寸解析失败不阻断上传（宽高可缺）。`GET /uploads/files/:id` 用 `sendFile` 读 `data/uploads`；不存在 → 404 JSON `File not found`。聊天引用附件时只传 `{ id, type: "image" }`，由 `getOwnedUpload` 校验归属——**读文件接口本身不校验 owner**。
 
 #### 会话列表与 PATCH
 
@@ -425,7 +467,9 @@ H5 当前消费 `conversationId` / `content`，不展示 `usage`；字段仍可�
 | 上传缺 `file` | 400 | `Missing file field: file` |
 | MIME 非 JPEG/PNG/WebP | 400 | `仅支持 JPEG / PNG / WebP 图片` |
 | 上传 > 5MB | 400 | `图片过大，最大 5MB` |
-| 读上传文件 404 | 404 | `File not found`（`GET /uploads/files/:id` 无鉴权，靠 UUID 不透明） |
+| 读上传文件 404 | 404 | `File not found`（无鉴权；长缓存，换内容须换新 id） |
+| 认证账号非法 / 密码过短 | 400 | 见上方认证错误表 |
+| 账号冲突 / 登录失败 | 409 / 401 | `该账号已注册` / `账号或密码错误` |
 | 逆地理缺/非法坐标 | 400 | `Missing or invalid query: lat, lon` / `lat/lon out of range` |
 | 逆地理上游失败 | 502 | 外网超时或供应商错误原文 |
 | PATCH 无有效字段 | 400 | `Nothing to update` |
@@ -534,6 +578,9 @@ docker run --rm -p 5000:5000 \
 | 现象 | 排查 |
 |------|------|
 | 注册 / 登录 500 或不可用 | 未设置 `JWT_SECRET`（启动时会打 warn） |
+| 登录后合并计数为 0 | body 未带与匿名期相同的 `clientId`；或匿名侧本无会话/规划 |
+| 评测大量 FAIL / 退出码 1 | 查模型 Key；`requireRag` 用例需 `data/knowledge` 有内容；默认 dryTools，设 `EVAL_DRY_TOOLS=0` 才打真实天气/地理 |
+| 上传图可打开但 chat 报 Invalid attachment | `GET /uploads/files/:id` 不校验归属；chat 引用须属当前 owner |
 | `/recommend` 立刻 400 JSON | 缺 `city` / `budget` / `days`，尚未进入 SSE |
 | 规划 `RATE_LIMITED` | 上游 LLM 限流；事件带 `retryAfter`，前端会倒计时重试 |
 | 规划 `PARSE_FAILED` | 模型输出非预期 JSON；重试或检查主模型是否适合结构化输出 |

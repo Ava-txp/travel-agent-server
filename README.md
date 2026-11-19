@@ -35,12 +35,15 @@ src/
   index.ts       # 入口
 data/
   knowledge/     # RAG 文档（按城市 Markdown）
-  uploads/       # 上传图片（运行时）
-  *.db           # SQLite 数据文件（运行时）
+  uploads/       # 上传图片文件（运行时）
+  chat.db        # 用户 / 会话 / 消息 / 上传元数据（WAL）
+  plans.db       # 行程规划记录（WAL）
 evals/           # Agent 评测用例
 scripts/         # 评测脚本
 Dockerfile       # 多阶段构建；entrypoint 首次 seed 知识库
 ```
+
+持久化约定（对照 `src/db/*`）：`chat.db` 由 `userStore` / `chatStore` / `uploadStore` 共用；`plans.db` 独立；均开启 `journal_mode=WAL` 与 `foreign_keys=ON`。Docker 把 `/app/data` 挂卷即可一并持久化库与上传。
 
 ## 流程图
 
@@ -197,6 +200,28 @@ EVAL_DRY_TOOLS=0 npm run eval   # 真实调用工具（需外网）
 查询规则（`chatStore` / `planStore` / `uploadStore`）：**有 `userId` 按用户查；否则按 `clientId` 且 `user_id IS NULL`**。登录/注册若 body 带 `clientId`，会把该匿名会话与规划 `UPDATE` 到正式 `user_id`（返回 `mergedConversations` / `mergedPlans`）。
 
 例外：`POST /recommend` 不强制 `X-Client-Id`；有则落库并在 `done` 带 `id`，无则只流式返回不持久化。
+
+### 鉴权中间件与 JWT
+
+| 中间件 | 行为 |
+|--------|------|
+| `optionalAuth` | 有合法 Bearer 则挂 `req.user`；无效 / 缺省继续匿名（不 401） |
+| `requireAuth` | 缺 Token → `401 Unauthorized`；无效/过期 → `401 Invalid or expired token` |
+
+JWT（`src/utils/jwt.ts`）：payload 为 `{ sub: userId, account }`；`JWT_EXPIRES_IN` 默认 `7d`；未设 `JWT_SECRET` 时签发/校验会抛错（auth 路由实际不可用）。旅行域走 `optionalAuth`；仅 `GET /api/auth/me` 强制 `requireAuth`。
+
+### 统一错误处理
+
+`src/middleware/errorHandler.ts` 挂在全部路由之后：
+
+| 来源 | 客户端看到 |
+|------|------------|
+| `throw new HttpError(status, message)` | `{ status:"error", message }`，HTTP = status |
+| Express / 中间件可暴露 4xx（`expose === true`） | 同上，原样 message |
+| 其它未捕获异常 | 打日志；`500` + `服务异常，请稍后重试` |
+| 已开始写响应（如 SSE） | 无法改状态码，仅 `res.end()` 断开 |
+
+异步 handler 须包 `asyncHandler`，否则 Express 4 不会把 Promise reject 交给错误中间件。业务可预期错误优先在路由内直接 `res.status(4xx)`，与 `HttpError` 二选一即可。
 
 ## API 一览
 
@@ -548,13 +573,28 @@ tags: 故宫,长城,颐和园
 
 ## 上下文窗口（Token 预算）
 
-对话在进入 Agent 前会走 `prepareChatContext`：
+对话在进入 Agent 前会走 `prepareChatContext`（`src/utils/contextWindow.ts`）：
 
-1. **启发式 Token 估算**（中英混合，见 `src/utils/tokenCounter.ts`）
-2. **滑动窗口**：从最新消息向前填满输入预算
-3. **摘要压缩**（默认开启）：被滑出的旧消息经 LLM 压成短摘要再注入
+1. **条数预截断**：路由侧 `listRecentMessages` 先取最多 **40** 条候选（`Math.max(MAX_CHAT_HISTORY, 40)`；`MAX_CHAT_HISTORY` 常量默认 20）
+2. **启发式 Token 估算**（中英混合，见 `src/utils/tokenCounter.ts`）
+3. **滑动窗口**：从最新消息向前填满输入预算；当前用户消息单独占预算
+4. **摘要压缩**（默认开启）：被滑出的旧消息经 `summarizeHistory` 压成 `【早期对话摘要】` 前置；摘要失败则仅滑动窗口
 
-相关环境变量见 `.env.example`（`CONTEXT_MAX_TOKENS` 等）。SSE `done` 事件的 `content.usage` 会带回估算统计。
+输入预算公式：
+
+```text
+maxInputTokens = max(512, CONTEXT_MAX_TOKENS - CONTEXT_RESERVE_RESPONSE - CONTEXT_RESERVE_SYSTEM)
+historyBudget  = max(0, maxInputTokens - currentMessageTokens)
+```
+
+| 环境变量 | 默认 | 含义 |
+|----------|------|------|
+| `CONTEXT_MAX_TOKENS` | `32000` | 模型上下文总窗口 |
+| `CONTEXT_RESERVE_RESPONSE` | `2048` | 预留输出 |
+| `CONTEXT_RESERVE_SYSTEM` | `3000` | 预留 system / RAG / 工具 schema |
+| `CONTEXT_ENABLE_SUMMARY` | 开启（设 `0` 关闭） | 是否对滑出消息做 LLM 摘要 |
+
+SSE `done.content.usage` 带回估算统计（见上文 chat 事件表）。
 
 ## Docker
 
@@ -591,6 +631,9 @@ docker run --rm -p 5000:5000 \
 | 规划列表空但刚生成过 | `done` 无 `id`：缺 `X-Client-Id` 或 `persistPlan` 落库异常（看服务端日志） |
 | 会话 PATCH 400 | 确认 body 有 `title` 字符串或 `pinned` 布尔；标题勿全空白 |
 | 列表排序不符合预期 | 服务端按置顶优先再按 `updated_at`；置顶本身不刷新 `updated_at` |
+| `/me` 401 `Unauthorized` | 缺 Bearer；`Invalid or expired token` 则密钥变了或已过期 |
+| 长对话丢早期细节 | 先 40 条候选再 token 滑动；可调大 `CONTEXT_*` 或确认未关摘要（`CONTEXT_ENABLE_SUMMARY`） |
 | Docker 知识库为空 | 确认 volume 首次为空从而触发 seed；或手动挂载 `data/knowledge` |
 | better-sqlite3 本地编译失败 | 需本机 Python / make / g++；Docker 构建已在 builder 阶段安装 |
+| 数据卷丢库 | 确认挂载了 `/app/data`（含 `chat.db` / `plans.db` / `uploads`） |
 

@@ -122,6 +122,8 @@ flowchart LR
   E --> F[后续请求<br/>Bearer + X-Client-Id]
 ```
 
+合并范围仅限 **会话**（`mergeAnonymousConversations`）与 **规划**（`mergeAnonymousPlans`）。上传附件不合并：匿名期 `user_id IS NULL` 的图片登录后仍属匿名 owner，续聊引用旧 `attachments[].id` 会 `Invalid attachment`，需重新上传。
+
 ## 快速开始
 
 ### 1. 环境要求
@@ -151,7 +153,7 @@ npm install
 
 可选：
 
-- `ATTACH_IMAGES_TO_CHAT=1`：最终对话轮把原图一并发给主模型（主模型需支持视觉）
+- `FORCE_TEXT_CHAT_WITH_IMAGES=1`：有图时强制走主模型文本路径（默认把原图交给 Vision 模型流式直答，不绑工具）
 - `ENABLE_SCENE_PIPELINE=1`：有图时先跑 Vision「分类 + 抽取」；默认关闭，直接把原图交给 Vision 模型回答
 - `NOMINATIM_USER_AGENT`：Nominatim 回退请求的 User-Agent（默认 `travel-recommend-h5/1.0`）
 
@@ -257,7 +259,7 @@ JWT（`src/utils/jwt.ts`）：payload 为 `{ sub: userId, account }`；`JWT_EXPI
 }
 ```
 
-有 `clientId` 时先 `mergeAnonymousConversations` / `mergeAnonymousPlans`，再签发 JWT；两计数字段为本次合并条数（无 `clientId` 则为 `0`）。`user` 不含密码哈希。
+有 `clientId` 时先 `mergeAnonymousConversations` / `mergeAnonymousPlans`，再签发 JWT；两计数字段为本次合并条数（无 `clientId` 则为 `0`）。**不合并 uploads**。`user` 不含密码哈希。
 
 | 场景 | HTTP | `message` |
 |------|------|-----------|
@@ -298,8 +300,8 @@ Authorization: Bearer <token>
 
 | 接口 | 约束 |
 |------|------|
-| `/recommend` | `days` 1–30；`budget` ≥ 100；缺字段返回 400 JSON（非 SSE） |
-| `/chat` | `message` 与 `attachments` 至少其一；附件最多 3 张，且须属当前 owner |
+| `/recommend` | 缺 `city`/`budget`/`days` → **400 JSON**（尚未进 SSE）。`days` 不在 1–30 或 `budget` 小于 100 → **已开 SSE**（先发 `stage:generating`），再以 SSE `error` 返回文案（无 `code`） |
+| `/chat` | `message` 与 `attachments` 至少其一；附件最多 3 张，且须属当前 owner；未知 `sceneHint` 静默忽略为 `null` |
 | `/uploads/image` | JPEG / PNG / WebP；单文件 ≤ 5MB；multipart field 名必须为 `file` |
 | `/uploads/files/:id` | **无鉴权**；靠 UUID 不透明；按库内 `mime` 设 `Content-Type`；`Cache-Control: public, max-age=31536000, immutable` |
 | `/location/reverse` | query `lat`/`lon` 须为有限数字；纬度 ∈ [-90,90]，经度 ∈ [-180,180] |
@@ -331,6 +333,8 @@ Authorization: Bearer <token>
 ```
 
 说明：首轮自动生成标题走 `truncateTitle` 默认上限 **20** 字；手动重命名上限 **40** 字。`POST /conversations` 默认标题为「新对话」，响应不含 `pinned`（恒为未置顶）。
+
+`GET /conversations/:id` 详情（`ConversationDetail`）含 `id` / `title` / `createdAt` / `updatedAt` / `messages[]`（`attachments?` / `sceneHint?`），**不含 `pinned`**。首轮标题：先按用户文本截断 20 字，或场景默认标题（如「景点路牌识别」），再异步 LLM 摘要可能覆盖。
 
 #### 逆地理编码 `GET /location/reverse`
 
@@ -387,7 +391,7 @@ Authorization: Bearer <token>
 |------|------|----------|
 | `GET` | `/plans` | `{ status:"ok", data: PlanSummary[] }`，按 `updated_at DESC` |
 | `GET` | `/plans/:id` | `{ status:"ok", data: PlanDetail }`；无权限/不存在 → 404 `Plan not found` |
-| `DELETE` | `/plans/:id` | `{ status:"ok", data: { id } }`；未删到 → 404 |
+| `DELETE` | `/plans/:id` | `{ status: "ok" }`（无 `data`，与删会话一致）；未删到 → 404 |
 
 `PlanSummary`（`planStore.ts`）：
 
@@ -403,6 +407,8 @@ Authorization: Bearer <token>
 #### SSE 约定
 
 两条流式接口均返回 `Content-Type: text/event-stream`，每条事件一行 `data: <json>\n\n`（见 `src/utils/streamUtils.ts`）。设置了 `X-Accel-Buffering: no` 以便反代实时推送。客户端断开时会 `AbortController.abort()` 取消 LLM。
+
+**`/chat` 中止语义**：客户端断开后，若已有非空助手文本，仍可能 `addMessage` 落库部分回复；响应直接 `end`，**不再发 `done` / `error`**。前端应保留已展示 partial，勿当成协议错误。
 
 **`POST /recommend` 事件**（实现：`src/routes/recommend.ts` + `recommendStream.ts`）：
 
@@ -511,7 +517,7 @@ H5 当前消费 `conversationId` / `content`，不展示 `usage`；字段仍可�
 - `ticket_itinerary` — 门票 / 行程单
 - `food_menu` — 菜单
 
-默认有图时把原图交给 Vision 模型直答；仅当 `ENABLE_SCENE_PIPELINE=1` 时才走「分类 + 结构化抽取」再注入上下文（`scenes.ts` → `runScenePipeline`）。关闭管线时仍可用 `buildSceneHintContext(sceneHint)` 注入回答大纲。
+默认有图时把原图交给 Vision 模型直答（不绑工具）；设 `FORCE_TEXT_CHAT_WITH_IMAGES=1` 才退回主模型文本路径。仅当 `ENABLE_SCENE_PIPELINE=1` 时才走「分类 + 结构化抽取」再注入上下文（`scenes.ts` → `runScenePipeline`）。关闭管线时仍可用 `buildSceneHintContext(sceneHint)` 注入回答大纲。纯图无文字时，用户侧默认填「请结合我上传的图片给出旅游相关建议。」
 
 管线步骤：`classifyScene` → 按场景 `extract*` → `contextBlock` 写入 system prompt。分类失败或无图时回退 `sceneHint ?? "unknown"`。
 
@@ -535,7 +541,7 @@ H5 当前消费 `conversationId` / `content`，不展示 `usage`；字段仍可�
 
 ## Agent 与工具
 
-对话由 `TravelAgent` 编排（`createTravelTools`），工具结果统一为 JSON 字符串：`{ ok: true, data }` 或 `{ ok: false, tool, error }`。`EVAL_DRY_TOOLS=1` / `dryTools` 时天气与地理走桩数据。
+对话由 `TravelAgent` 编排（`createTravelTools`），工具结果统一为 JSON 字符串：`{ ok: true, data }` 或 `{ ok: false, tool, error }`。`EVAL_DRY_TOOLS=1` / `dryTools` 时天气与地理走桩数据。主模型工具轮上限 **`MAX_TOOL_ROUNDS = 3`**，超限后不再绑工具做最终流式回答；Vision 直答路径从不绑定工具。
 
 | 工具 | 参数（Zod） | 行为要点 |
 |------|-------------|----------|
@@ -569,7 +575,8 @@ tags: 故宫,长城,颐和园
 
 - `type: both` 时，标题含「景点|必去」偏 attraction，「攻略|交通|美食|住宿|游玩」偏 guide
 - 检索：中英 token + 城市软过滤；工具与 system RAG 注入共用（见 `src/rag/knowledgeBase.ts`）
-- 新增城市：在该目录加 Markdown → 本地重启；Docker 需更新镜像或挂载覆盖 volume（空 volume 仅首次从 seed 拷贝）
+- Agent 侧 `extractCityHint` 硬编码城市：北京 / 上海 / 成都 / 杭州 / 东京 / 西安（仅软过滤提示，未命中不阻断）
+- 新增城市：在该目录加 Markdown → 本地重启；Docker 需更新镜像或挂载覆盖 volume（空 volume 仅首次从 seed 拷贝）；若要让对话自动带城市 hint，还需扩展 `extractCityHint` 列表
 
 ## 上下文窗口（Token 预算）
 
@@ -598,7 +605,7 @@ SSE `done.content.usage` 带回估算统计（见上文 chat 事件表）。
 
 ## Docker
 
-本仓库仅含后端镜像（无 `docker-compose.yml`）。知识库在镜像内作为 `knowledge-seed`；命名卷首次挂载空的 `/app/data/knowledge` 时，`docker-entrypoint.sh` 会拷贝 seed。
+本仓库仅含后端镜像（无 `docker-compose.yml`）。多阶段构建：`node:20-bookworm-slim`；运行时 `NODE_ENV=production`，以 root 启动（命名卷属主兼容）。知识库在镜像内作为 `knowledge-seed`；命名卷首次挂载空的 `/app/data/knowledge` 时，`docker-entrypoint.sh` 会拷贝 seed。
 
 ```bash
 # 构建
@@ -611,7 +618,7 @@ docker run --rm -p 5000:5000 \
   travel-server
 ```
 
-健康检查探测 `GET /api/heartbeat`。与前端联调时：H5 镜像的 Nginx 把 `/api/` 反代到主机名 `server:5000`（见 `travel-agent-H5` 的 `nginx.conf`），Compose 中请把本服务命名为 `server`，并为 SSE 关闭缓冲、拉长超时。
+`HEALTHCHECK`：间隔 30s / 超时 5s / 启动宽限 15s / 重试 3，探测 `GET /api/heartbeat`。与前端联调时：H5 镜像的 Nginx 把 `/api/` 反代到主机名 `server:5000`（见 `travel-agent-H5` 的 `nginx.conf`），Compose 中请把本服务命名为 `server`，并为 SSE 关闭缓冲、拉长超时。后端未挂 CORS；浏览器跨域直连会失败，需同源反代。
 
 ## 故障排查
 
@@ -619,11 +626,15 @@ docker run --rm -p 5000:5000 \
 |------|------|
 | 注册 / 登录 500 或不可用 | 未设置 `JWT_SECRET`（启动时会打 warn） |
 | 登录后合并计数为 0 | body 未带与匿名期相同的 `clientId`；或匿名侧本无会话/规划 |
+| 登录后旧图 Invalid attachment | 上传不参与登录合并；重新上传后再发 |
 | 评测大量 FAIL / 退出码 1 | 查模型 Key；`requireRag` 用例需 `data/knowledge` 有内容；默认 dryTools，设 `EVAL_DRY_TOOLS=0` 才打真实天气/地理 |
 | 上传图可打开但 chat 报 Invalid attachment | `GET /uploads/files/:id` 不校验归属；chat 引用须属当前 owner |
 | `/recommend` 立刻 400 JSON | 缺 `city` / `budget` / `days`，尚未进入 SSE |
+| `/recommend` 已开流但立刻 SSE error（天数/预算） | 缺字段才是 400；范围错误发生在 `stage` 之后 |
 | 规划 `RATE_LIMITED` | 上游 LLM 限流；事件带 `retryAfter`，前端会倒计时重试 |
 | 规划 `PARSE_FAILED` | 模型输出非预期 JSON；重试或检查主模型是否适合结构化输出 |
+| 有图却走主模型 / 工具 | 默认 Vision 直答；仅 `FORCE_TEXT_CHAT_WITH_IMAGES=1` 才强制文本路径 |
+| 对话中止后无 `done` | 预期：abort 可落库 partial，流直接结束 |
 | 对话无场景抽取 | 默认未开管线；需要时设 `ENABLE_SCENE_PIPELINE=1` 且配置可用的 Vision 模型（`SILICONFLOW_VISION_MODEL`） |
 | 管线分类总回退 unknown | 看 Vision 日志 `[scenes] classifyScene failed`；确认 VL 模型可用且返回 JSON |
 | `/location/reverse` 502 | BigDataCloud 与 Nominatim 均失败；查出站网络 / 超时（8s）；Nominatim 可用 `NOMINATIM_USER_AGENT` |

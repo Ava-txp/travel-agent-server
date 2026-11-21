@@ -210,7 +210,7 @@ EVAL_DRY_TOOLS=0 npm run eval   # 真实调用工具（需外网）
 | `optionalAuth` | 有合法 Bearer 则挂 `req.user`；无效 / 缺省继续匿名（不 401） |
 | `requireAuth` | 缺 Token → `401 Unauthorized`；无效/过期 → `401 Invalid or expired token` |
 
-JWT（`src/utils/jwt.ts`）：payload 为 `{ sub: userId, account }`；`JWT_EXPIRES_IN` 默认 `7d`；未设 `JWT_SECRET` 时签发/校验会抛错（auth 路由实际不可用）。旅行域走 `optionalAuth`；仅 `GET /api/auth/me` 强制 `requireAuth`。
+JWT（`src/utils/jwt.ts`）：payload 为 `{ sub: userId, account }`；校验后挂到中间件的 `AuthUser` 仅 `{ id, account }`（无 nickname）。`JWT_EXPIRES_IN` 默认 `7d`；未设 `JWT_SECRET` 时签发/校验会抛错（auth 路由实际不可用）。旅行域走 `optionalAuth`；仅 `GET /api/auth/me` 强制 `requireAuth`。登录/注册/`/me` 响应里的 `user` 才是完整公开资料 `{ id, account, nickname, createdAt }`——勿把 JWT claims 与 API `user` 混为一谈。
 
 ### 统一错误处理
 
@@ -519,6 +519,8 @@ H5 当前消费 `conversationId` / `content`，不展示 `usage`；字段仍可�
 
 默认有图时把原图交给 Vision 模型直答（不绑工具）；设 `FORCE_TEXT_CHAT_WITH_IMAGES=1` 才退回主模型文本路径。仅当 `ENABLE_SCENE_PIPELINE=1` 时才走「分类 + 结构化抽取」再注入上下文（`scenes.ts` → `runScenePipeline`）。关闭管线时仍可用 `buildSceneHintContext(sceneHint)` 注入回答大纲。纯图无文字时，用户侧默认填「请结合我上传的图片给出旅游相关建议。」
 
+**模型 kwargs（`TravelService`）**：主模型 `initLLM` 固定 `modelKwargs.enable_thinking = false`。Vision `initVisionLLM` **刻意不写** `enable_thinking`——Qwen3-VL 等视觉模型不支持该参数，写入会失败；换 VL 供应商时勿照搬主模型 kwargs。
+
 管线步骤：`classifyScene` → 按场景 `extract*` → `contextBlock` 写入 system prompt。分类失败或无图时回退 `sceneHint ?? "unknown"`。
 
 **分类 JSON**（模型只应输出）：
@@ -634,6 +636,7 @@ docker run --rm -p 5000:5000 \
 | 规划 `RATE_LIMITED` | 上游 LLM 限流；事件带 `retryAfter`，前端会倒计时重试 |
 | 规划 `PARSE_FAILED` | 模型输出非预期 JSON；重试或检查主模型是否适合结构化输出 |
 | 有图却走主模型 / 工具 | 默认 Vision 直答；仅 `FORCE_TEXT_CHAT_WITH_IMAGES=1` 才强制文本路径 |
+| Vision 初始化失败 / 参数拒识 | 勿给 VL 写 `enable_thinking`（主模型才有 `false`）；核对 `*_VISION_MODEL` 为对话型 VL |
 | 对话中止后无 `done` | 预期：abort 可落库 partial，流直接结束 |
 | 对话无场景抽取 | 默认未开管线；需要时设 `ENABLE_SCENE_PIPELINE=1` 且配置可用的 Vision 模型（`SILICONFLOW_VISION_MODEL`） |
 | 管线分类总回退 unknown | 看 Vision 日志 `[scenes] classifyScene failed`；确认 VL 模型可用且返回 JSON |

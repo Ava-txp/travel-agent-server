@@ -147,15 +147,18 @@ npm install
 | `SILICONFLOW_API_KEY` | API Key |
 | `SILICONFLOW_BASE_URL` | 兼容 OpenAI 的 Base URL |
 | `SILICONFLOW_MODEL` | 主对话模型 |
-| `SILICONFLOW_VISION_MODEL` | 多模态 / Vision 模型（需支持视觉） |
+| `SILICONFLOW_VISION_MODEL` | 多模态 / Vision 模型（需支持视觉；见下方解析顺序） |
 | `JWT_SECRET` | JWT 签名密钥（未设置时 auth 路由不可用） |
 | `JWT_EXPIRES_IN` | Token 有效期，默认 `7d` |
+
+Vision 模型解析顺序（`initVisionLLM`）：`${MODEL_PROVIDER}_VISION_MODEL` → 通用 `VISION_MODEL` → 回退 `${MODEL_PROVIDER}_MODEL`（未配 VL 时与主模型相同，有图对话会退化）。
 
 可选：
 
 - `FORCE_TEXT_CHAT_WITH_IMAGES=1`：有图时强制走主模型文本路径（默认把原图交给 Vision 模型流式直答，不绑工具）
 - `ENABLE_SCENE_PIPELINE=1`：有图时先跑 Vision「分类 + 抽取」；默认关闭，直接把原图交给 Vision 模型回答
 - `NOMINATIM_USER_AGENT`：Nominatim 回退请求的 User-Agent（默认 `travel-recommend-h5/1.0`）
+- `VISION_MODEL`：跨 provider 的 Vision 模型名（仅当未设 `${PROVIDER}_VISION_MODEL` 时生效）
 
 ### 3. 启动
 
@@ -334,7 +337,13 @@ Authorization: Bearer <token>
 
 说明：首轮自动生成标题走 `truncateTitle` 默认上限 **20** 字；手动重命名上限 **40** 字。`POST /conversations` 默认标题为「新对话」，响应不含 `pinned`（恒为未置顶）。
 
-`GET /conversations/:id` 详情（`ConversationDetail`）含 `id` / `title` / `createdAt` / `updatedAt` / `messages[]`（`attachments?` / `sceneHint?`），**不含 `pinned`**。首轮标题：先按用户文本截断 20 字，或场景默认标题（如「景点路牌识别」），再异步 LLM 摘要可能覆盖。
+`GET /conversations/:id` 详情（`ConversationDetail`）含 `id` / `title` / `createdAt` / `updatedAt` / `messages[]`（`attachments?` / `sceneHint?`），**不含 `pinned`**。
+
+**首轮标题时序**（`routes/travel.ts` + `summarizeTitle`）：
+
+1. 即时兜底：有文本 → `truncateTitle(text)`（≤20）；纯图 → `sceneHintTitle(sceneHint)`（`spot_sign`→「景点路牌识别」、`ticket_itinerary`→「门票行程识别」、`food_menu`→「菜单推荐」、其它→「图片咨询」）
+2. 写入用户消息后，若有文本则 **fire-and-forget** 调 `travelService.summarizeTitle`（非流式、不阻塞 SSE）；成功再用 `truncateTitle(summary)` 覆盖
+3. 摘要失败 / 空结果：保留步骤 1 标题；提示词要求「只输出标题、≤20 字、体现目的地/天数/诉求」
 
 #### 逆地理编码 `GET /location/reverse`
 
@@ -410,6 +419,10 @@ Authorization: Bearer <token>
 
 **`/chat` 中止语义**：客户端断开后，若已有非空助手文本，仍可能 `addMessage` 落库部分回复；响应直接 `end`，**不再发 `done` / `error`**。前端应保留已展示 partial，勿当成协议错误。
 
+**`/recommend` 中止语义**：客户端断开同样 abort；`runRecommendStream` 直接 return，**不发 `done` / `error`，也不落库**（与 chat 不同：规划无 partial 持久化）。已推送的 `meta`/`day`/`budget` 仅存在于当次连接。
+
+**错误形状差异**：`/recommend` 的 SSE `error` 可带 `code` / `retryAfter`；`/chat` 的 `error` **只有** `message` 字符串（不含限流码）。规划限流默认 `retryAfter = 12`（上游未给 `Retry-After` 时，见 `llmErrors.readRetryAfterSec`）。
+
 **`POST /recommend` 事件**（实现：`src/routes/recommend.ts` + `recommendStream.ts`）：
 
 | `type` | 含义 |
@@ -419,7 +432,7 @@ Authorization: Bearer <token>
 | `day` | 某一天行程（按 day 号去重推送） |
 | `budget` | 预算拆分（`budgetBreakdown` 对象） |
 | `done` | 完整规划 JSON；若带了 `X-Client-Id` 会落库并带上 `id` |
-| `error` | 失败；可能含 `code`（如 `RATE_LIMITED`、`PARSE_FAILED`）与 `retryAfter` |
+| `error` | 失败；可能含 `code`（`RATE_LIMITED` / `PARSE_FAILED`）与 `retryAfter`（限流缺省 **12** 秒） |
 
 增量推送条件（`planPartialParse.ts`）：`day` 须同时具备 `day` 数字与 `morning` / `afternoon` / `evening`（且各段 `spot` 非空）才发出；`budget` 在 `budgetBreakdown` 对象完整闭合后发出一次。
 
@@ -519,7 +532,9 @@ H5 当前消费 `conversationId` / `content`，不展示 `usage`；字段仍可�
 
 默认有图时把原图交给 Vision 模型直答（不绑工具）；设 `FORCE_TEXT_CHAT_WITH_IMAGES=1` 才退回主模型文本路径。仅当 `ENABLE_SCENE_PIPELINE=1` 时才走「分类 + 结构化抽取」再注入上下文（`scenes.ts` → `runScenePipeline`）。关闭管线时仍可用 `buildSceneHintContext(sceneHint)` 注入回答大纲。纯图无文字时，用户侧默认填「请结合我上传的图片给出旅游相关建议。」
 
-**模型 kwargs（`TravelService`）**：主模型 `initLLM` 固定 `modelKwargs.enable_thinking = false`。Vision `initVisionLLM` **刻意不写** `enable_thinking`——Qwen3-VL 等视觉模型不支持该参数，写入会失败；换 VL 供应商时勿照搬主模型 kwargs。
+**模型 kwargs（`TravelService`）**：主模型 `initLLM`：`temperature=0.7`，固定 `modelKwargs.enable_thinking = false`。Vision `initVisionLLM`：`temperature=0.2`，**刻意不写** `enable_thinking`——Qwen3-VL 等视觉模型不支持该参数，写入会失败；换 VL 供应商时勿照搬主模型 kwargs。Vision 解析顺序见「快速开始」；未配 VL 时回退主模型名。
+
+**定位进 system prompt**（`buildTravelAgentSystemPrompt`）：有 `location` 时注入城市/坐标，并要求用户说「附近/当前位置」时用坐标调 `get_weather`；无定位时若问当前位置天气再追问城市。
 
 管线步骤：`classifyScene` → 按场景 `extract*` → `contextBlock` 写入 system prompt。分类失败或无图时回退 `sceneHint ?? "unknown"`。
 
@@ -587,7 +602,7 @@ tags: 故宫,长城,颐和园
 1. **条数预截断**：路由侧 `listRecentMessages` 先取最多 **40** 条候选（`Math.max(MAX_CHAT_HISTORY, 40)`；`MAX_CHAT_HISTORY` 常量默认 20）
 2. **启发式 Token 估算**（中英混合，见 `src/utils/tokenCounter.ts`）
 3. **滑动窗口**：从最新消息向前填满输入预算；当前用户消息单独占预算
-4. **摘要压缩**（默认开启）：被滑出的旧消息经 `summarizeHistory` 压成 `【早期对话摘要】` 前置；摘要失败则仅滑动窗口
+4. **摘要压缩**（默认开启）：被滑出的旧消息经 `summarizeHistory` 压成 `【早期对话摘要】` 前置；摘要失败则仅滑动窗口。`summarizeHistory` 把旧对话拼成 transcript 后 **截断至 6000 字符**，提示词要求摘要 ≤200 字、不编造；失败返回 `null`
 
 输入预算公式：
 
@@ -622,6 +637,25 @@ docker run --rm -p 5000:5000 \
 
 `HEALTHCHECK`：间隔 30s / 超时 5s / 启动宽限 15s / 重试 3，探测 `GET /api/heartbeat`。与前端联调时：H5 镜像的 Nginx 把 `/api/` 反代到主机名 `server:5000`（见 `travel-agent-H5` 的 `nginx.conf`），Compose 中请把本服务命名为 `server`，并为 SSE 关闭缓冲、拉长超时。后端未挂 CORS；浏览器跨域直连会失败，需同源反代。
 
+最小 Compose 示意（服务名必须为 `server`）：
+
+```yaml
+services:
+  server:
+    image: travel-server
+    env_file: ./.env
+    volumes:
+      - travel-server-data:/app/data
+  h5:
+    image: travel-h5
+    ports:
+      - "8080:80"
+    depends_on:
+      - server
+volumes:
+  travel-server-data:
+```
+
 ## 故障排查
 
 | 现象 | 排查 |
@@ -633,11 +667,15 @@ docker run --rm -p 5000:5000 \
 | 上传图可打开但 chat 报 Invalid attachment | `GET /uploads/files/:id` 不校验归属；chat 引用须属当前 owner |
 | `/recommend` 立刻 400 JSON | 缺 `city` / `budget` / `days`，尚未进入 SSE |
 | `/recommend` 已开流但立刻 SSE error（天数/预算） | 缺字段才是 400；范围错误发生在 `stage` 之后 |
-| 规划 `RATE_LIMITED` | 上游 LLM 限流；事件带 `retryAfter`，前端会倒计时重试 |
+| 规划 `RATE_LIMITED` | 上游 LLM 限流；`retryAfter` 缺省 12s，前端倒计时后再试 |
 | 规划 `PARSE_FAILED` | 模型输出非预期 JSON；重试或检查主模型是否适合结构化输出 |
+| 规划中止后无 `done` 且无记录 | 预期：abort 不落库；仅当次已收事件留在客户端 |
+| chat SSE `error` 无限流码 | 预期：chat 只回 `message`；限流码仅 recommend 路径 |
 | 有图却走主模型 / 工具 | 默认 Vision 直答；仅 `FORCE_TEXT_CHAT_WITH_IMAGES=1` 才强制文本路径 |
 | Vision 初始化失败 / 参数拒识 | 勿给 VL 写 `enable_thinking`（主模型才有 `false`）；核对 `*_VISION_MODEL` 为对话型 VL |
+| 有图但像纯文本模型 | 未设 `*_VISION_MODEL`/`VISION_MODEL` 时回退主模型名 |
 | 对话中止后无 `done` | 预期：abort 可落库 partial，流直接结束 |
+| 会话标题一直是截断原文 | `summarizeTitle` 异步失败或空结果；看服务端日志，不影响对话 |
 | 对话无场景抽取 | 默认未开管线；需要时设 `ENABLE_SCENE_PIPELINE=1` 且配置可用的 Vision 模型（`SILICONFLOW_VISION_MODEL`） |
 | 管线分类总回退 unknown | 看 Vision 日志 `[scenes] classifyScene failed`；确认 VL 模型可用且返回 JSON |
 | `/location/reverse` 502 | BigDataCloud 与 Nominatim 均失败；查出站网络 / 超时（8s）；Nominatim 可用 `NOMINATIM_USER_AGENT` |

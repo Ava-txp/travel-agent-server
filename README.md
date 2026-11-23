@@ -246,7 +246,7 @@ JWT（`src/utils/jwt.ts`）：payload 为 `{ sub: userId, account }`；校验后
 | `GET` | `/me` | 当前用户（需 Bearer Token） |
 | `POST` | `/logout` | 登出（服务端无状态；客户端丢弃 Token 即可） |
 
-约束：`account` 为大陆手机号（`1` + 10 位）或邮箱；邮箱存小写；密码 ≥ 6 位；昵称可选、最长 20（缺省按手机后四位或邮箱前缀生成）；未设 `JWT_SECRET` 时鉴权路由不可用。Body 解析支持 `application/json` 与 `application/x-www-form-urlencoded`（见 `src/index.ts`）。
+约束：`account` 为大陆手机号（`1` + 10 位）或邮箱；邮箱存小写；密码 ≥ 6 位；昵称可选、最长 20（缺省按手机后四位或邮箱前缀生成）；密码哈希为 **bcryptjs、`BCRYPT_ROUNDS = 10`**（`src/routes/auth.ts`）；未设 `JWT_SECRET` 时鉴权路由不可用。Body 解析支持 `application/json` 与 `application/x-www-form-urlencoded`（见 `src/index.ts`）。
 
 `POST /register` / `POST /login` 成功（`issueAuthResponse`，HTTP 200）：
 
@@ -661,6 +661,7 @@ volumes:
 | 现象 | 排查 |
 |------|------|
 | 注册 / 登录 500 或不可用 | 未设置 `JWT_SECRET`（启动时会打 warn） |
+| 注册偶发偏慢 | 预期：`bcrypt.hashSync` 成本因子 10；勿在热路径再提高 rounds |
 | 登录后合并计数为 0 | body 未带与匿名期相同的 `clientId`；或匿名侧本无会话/规划 |
 | 登录后旧图 Invalid attachment | 上传不参与登录合并；重新上传后再发 |
 | 评测大量 FAIL / 退出码 1 | 查模型 Key；`requireRag` 用例需 `data/knowledge` 有内容；默认 dryTools，设 `EVAL_DRY_TOOLS=0` 才打真实天气/地理 |

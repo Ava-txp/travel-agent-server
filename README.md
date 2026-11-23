@@ -441,6 +441,16 @@ Authorization: Bearer <token>
 | `done` | 完整规划 JSON；若带了 `X-Client-Id` 会落库并带上 `id` |
 | `error` | 失败；可能含 `code`（`RATE_LIMITED` / `PARSE_FAILED`）与 `retryAfter`（限流缺省 **12** 秒） |
 
+常见 `error.message`（对照 `recommendStream.ts` / `recommend.ts`）：
+
+| 场景 | `code` | `message` |
+|------|--------|-----------|
+| `days` 不在 1–30 | （无） | `旅行天数需在 1–30 天之间` |
+| `budget` &lt; 100 | （无） | `预算需不少于 100 元` |
+| JSON 块缺失 / 解析失败 | `PARSE_FAILED` | `规划结果格式无效，请重试` |
+| 模型返回 `success:false` | `PARSE_FAILED` | 优先用模型 `message`，否则 `生成旅游规划失败` |
+| 上游限流 | `RATE_LIMITED` | `当前规划请求较多，请稍后再试`（`retryAfter` 缺省 12） |
+
 增量推送条件（`planPartialParse.ts`）：`day` 须同时具备 `day` 数字与 `morning` / `afternoon` / `evening`（且各段 `spot` 非空）才发出；`budget` 在 `budgetBreakdown` 对象完整闭合后发出一次。
 
 **规划 JSON 字段**（提示词约定：`recommendPrompt.ts`；H5 类型：`TravelPlan`）：
@@ -598,7 +608,7 @@ tags: 故宫,长城,颐和园
 ```
 
 - `type: both` 时，标题含「景点|必去」偏 attraction，「攻略|交通|美食|住宿|游玩」偏 guide
-- 检索（`retrieveKnowledge`）：中英 token；传入 `city` 时对不匹配城市的 chunk 做 **硬过滤**（不是软过滤）；`scoreChunk` 内另有城市加分。system 注入 `topK=3`，工具 `search_*` 用 `topK=4`
+- 检索（`retrieveKnowledge`）：中英 token；传入 `city` 时对「有 `chunk.city` 且与 hint 互不包含」的条目 **硬过滤**（空 `chunk.city` 仍可通过）；`scoreChunk` 内另有城市加分。system 注入 `topK=3`，工具 `search_*` 用 `topK=4`
 - Agent 侧 `extractCityHint` 硬编码城市：北京 / 上海 / 成都 / 杭州 / 东京 / 西安（按列表顺序取**首次命中**，非用户提及顺序）；未命中则不做城市过滤
 - 新增城市：在该目录加 Markdown → 本地重启；Docker 需更新镜像或挂载覆盖 volume（空 volume 仅首次从 seed 拷贝）；若要让对话自动带城市 hint，还需扩展 `extractCityHint` 列表
 

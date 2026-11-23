@@ -128,8 +128,9 @@ flowchart LR
 
 ### 1. 环境要求
 
-- Node.js 18+
+- Node.js 18+（本地）；Docker 镜像为 **Node 20**（`node:20-bookworm-slim`）
 - npm
+- 启动前须配齐 `MODEL_PROVIDER` 与 `${PROVIDER}_API_KEY` / `_BASE_URL` / `_MODEL`：`travelService` 在 **import 时** `new TravelService()`，缺项会抛错，进程到不了 `listen`
 
 ### 2. 安装与配置
 
@@ -304,7 +305,7 @@ Authorization: Bearer <token>
 | 接口 | 约束 |
 |------|------|
 | `/recommend` | 缺 `city`/`budget`/`days` → **400 JSON**（尚未进 SSE）。`days` 不在 1–30 或 `budget` 小于 100 → **已开 SSE**（先发 `stage:generating`），再以 SSE `error` 返回文案（无 `code`） |
-| `/chat` | `message` 与 `attachments` 至少其一；附件最多 3 张，且须属当前 owner；未知 `sceneHint` 静默忽略为 `null` |
+| `/chat` | `message` 与 `attachments` 至少其一；附件 **静默** `.slice(0, 3)`，非 `image`/缺 id 项丢弃（不因此 400）；须属当前 owner；未知 `sceneHint` 静默忽略为 `null` |
 | `/uploads/image` | JPEG / PNG / WebP；单文件 ≤ 5MB；multipart field 名必须为 `file` |
 | `/uploads/files/:id` | **无鉴权**；靠 UUID 不透明；按库内 `mime` 设 `Content-Type`；`Cache-Control: public, max-age=31536000, immutable` |
 | `/location/reverse` | query `lat`/`lon` 须为有限数字；纬度 ∈ [-90,90]，经度 ∈ [-180,180] |
@@ -338,6 +339,8 @@ Authorization: Bearer <token>
 说明：首轮自动生成标题走 `truncateTitle` 默认上限 **20** 字；手动重命名上限 **40** 字。`POST /conversations` 默认标题为「新对话」，响应不含 `pinned`（恒为未置顶）。
 
 `GET /conversations/:id` 详情（`ConversationDetail`）含 `id` / `title` / `createdAt` / `updatedAt` / `messages[]`（`attachments?` / `sceneHint?`），**不含 `pinned`**。
+
+`DELETE /conversations/:id` 成功：`{ status: "ok" }`。消息表对会话外键 **`ON DELETE CASCADE`**，删会话即清其消息。
 
 **首轮标题时序**（`routes/travel.ts` + `summarizeTitle`）：
 
@@ -418,6 +421,10 @@ Authorization: Bearer <token>
 两条流式接口均返回 `Content-Type: text/event-stream`，每条事件一行 `data: <json>\n\n`（见 `src/utils/streamUtils.ts`）。设置了 `X-Accel-Buffering: no` 以便反代实时推送。客户端断开时会 `AbortController.abort()` 取消 LLM。
 
 **`/chat` 中止语义**：客户端断开后，若已有非空助手文本，仍可能 `addMessage` 落库部分回复；响应直接 `end`，**不再发 `done` / `error`**。前端应保留已展示 partial，勿当成协议错误。
+
+**工具轮 SSE**：出现 `tool_call` 后本轮不再向客户端推正文；确认进入工具调用后会 **清空** `fullText` 再跑工具并流式最终答。客户端可能短暂见过工具前 preamble，但 `done`/落库以工具后文本为准。若 `success === false` 且已有助手文本，仍可能先落库再发 SSE `error`（无 `done`）。
+
+历史送入 LLM：空文本但有附件的消息映射为占位串「`[用户上传了图片]`」。
 
 **`/recommend` 中止语义**：客户端断开同样 abort；`runRecommendStream` 直接 return，**不发 `done` / `error`，也不落库**（与 chat 不同：规划无 partial 持久化）。已推送的 `meta`/`day`/`budget` 仅存在于当次连接。
 
@@ -536,7 +543,7 @@ H5 当前消费 `conversationId` / `content`，不展示 `usage`；字段仍可�
 
 **定位进 system prompt**（`buildTravelAgentSystemPrompt`）：有 `location` 时注入城市/坐标，并要求用户说「附近/当前位置」时用坐标调 `get_weather`；无定位时若问当前位置天气再追问城市。
 
-管线步骤：`classifyScene` → 按场景 `extract*` → `contextBlock` 写入 system prompt。分类失败或无图时回退 `sceneHint ?? "unknown"`。
+管线步骤：`classifyScene` → 按场景 `extract*` → `contextBlock` 写入 system prompt。分类失败或无图时回退 `sceneHint ?? "unknown"`。**分类只看第一张图**（`imageDataUrls.slice(0, 1)`）；多图时后续张不参与分类。
 
 **分类 JSON**（模型只应输出）：
 
@@ -591,8 +598,8 @@ tags: 故宫,长城,颐和园
 ```
 
 - `type: both` 时，标题含「景点|必去」偏 attraction，「攻略|交通|美食|住宿|游玩」偏 guide
-- 检索：中英 token + 城市软过滤；工具与 system RAG 注入共用（见 `src/rag/knowledgeBase.ts`）
-- Agent 侧 `extractCityHint` 硬编码城市：北京 / 上海 / 成都 / 杭州 / 东京 / 西安（仅软过滤提示，未命中不阻断）
+- 检索（`retrieveKnowledge`）：中英 token；传入 `city` 时对不匹配城市的 chunk 做 **硬过滤**（不是软过滤）；`scoreChunk` 内另有城市加分。system 注入 `topK=3`，工具 `search_*` 用 `topK=4`
+- Agent 侧 `extractCityHint` 硬编码城市：北京 / 上海 / 成都 / 杭州 / 东京 / 西安（按列表顺序取**首次命中**，非用户提及顺序）；未命中则不做城市过滤
 - 新增城市：在该目录加 Markdown → 本地重启；Docker 需更新镜像或挂载覆盖 volume（空 volume 仅首次从 seed 拷贝）；若要让对话自动带城市 hint，还需扩展 `extractCityHint` 列表
 
 ## 上下文窗口（Token 预算）
@@ -662,6 +669,9 @@ volumes:
 |------|------|
 | 注册 / 登录 500 或不可用 | 未设置 `JWT_SECRET`（启动时会打 warn） |
 | 注册偶发偏慢 | 预期：`bcrypt.hashSync` 成本因子 10；勿在热路径再提高 rounds |
+| 进程启动即崩、无 listen | `MODEL_PROVIDER` 或 `${PROVIDER}_*` 缺项：`TravelService` 在 import 时构造 |
+| 对话里闪过一段又消失 | 工具轮前 preamble；最终以工具后流式文本 / 落库为准 |
+| 多图分类不准 | `classifyScene` 只看第一张；管线抽取可再看多图 |
 | 登录后合并计数为 0 | body 未带与匿名期相同的 `clientId`；或匿名侧本无会话/规划 |
 | 登录后旧图 Invalid attachment | 上传不参与登录合并；重新上传后再发 |
 | 评测大量 FAIL / 退出码 1 | 查模型 Key；`requireRag` 用例需 `data/knowledge` 有内容；默认 dryTools，设 `EVAL_DRY_TOOLS=0` 才打真实天气/地理 |

@@ -45,6 +45,8 @@ Dockerfile       # 多阶段构建；entrypoint 首次 seed 知识库
 
 持久化约定（对照 `src/db/*`）：`chat.db` 由 `userStore` / `chatStore` / `uploadStore` 共用；`plans.db` 独立；均开启 `journal_mode=WAL` 与 `foreign_keys=ON`。Docker 把 `/app/data` 挂卷即可一并持久化库与上传。
 
+**WAL 备份注意**：运行中还会出现同目录 sidecar `*.db-wal` / `*.db-shm`。只拷贝主 `.db` 可能丢未 checkpoint 的写入。安全做法：停进程后拷贝整组文件，或先对连接执行 `PRAGMA wal_checkpoint(TRUNCATE)` 再备份主库。
+
 ## 流程图
 
 ### 系统架构
@@ -418,7 +420,18 @@ Authorization: Bearer <token>
 
 #### SSE 约定
 
-两条流式接口均返回 `Content-Type: text/event-stream`，每条事件一行 `data: <json>\n\n`（见 `src/utils/streamUtils.ts`）。设置了 `X-Accel-Buffering: no` 以便反代实时推送。客户端断开时会 `AbortController.abort()` 取消 LLM。
+两条流式接口均由 `createStreamResponse`（`src/utils/streamUtils.ts`）初始化，每条事件一行 `data: <json>\n\n`。响应头：
+
+| Header | 值 | 作用 |
+|--------|-----|------|
+| `Content-Type` | `text/event-stream; charset=utf-8` | SSE |
+| `Cache-Control` | `no-cache, no-transform` | 禁缓存 / 防中间层改写 |
+| `Connection` | `keep-alive` | 长连接 |
+| `X-Accel-Buffering` | `no` | 关 nginx 等反代缓冲，保证实时推送 |
+
+另会尽量 `flushHeaders()`，并在每次 `write` 后调用 compression 中间件提供的 `flush()`（若存在），避免 SSE 被整包缓冲。客户端已断开（`writableEnded` / `destroyed` / 非 `writable`）时不再写入。客户端断开时会 `AbortController.abort()` 取消 LLM。
+
+**无 `TIMEOUT` SSE `code`**：`llmErrors.isTimeoutError` 已实现（识别 408/504 与 timeout 文案），但 **chat / recommend 路由均未调用**；超时通常表现为客户端 abort、外网工具抛错原文，或归入通用 `error.message` / `RATE_LIMITED`，不要期待 `code: "TIMEOUT"`。
 
 **`/chat` 中止语义**：客户端断开后，若已有非空助手文本，仍可能 `addMessage` 落库部分回复；响应直接 `end`，**不再发 `done` / `error`**。前端应保留已展示 partial，勿当成协议错误。
 
@@ -617,7 +630,10 @@ tags: 故宫,长城,颐和园
 对话在进入 Agent 前会走 `prepareChatContext`（`src/utils/contextWindow.ts`）：
 
 1. **条数预截断**：路由侧 `listRecentMessages` 先取最多 **40** 条候选（`Math.max(MAX_CHAT_HISTORY, 40)`；`MAX_CHAT_HISTORY` 常量默认 20）
-2. **启发式 Token 估算**（中英混合，见 `src/utils/tokenCounter.ts`）
+2. **启发式 Token 估算**（中英混合，见 `src/utils/tokenCounter.ts`；**非 tiktoken**，误差约 ±20%，计费以服务商为准）：
+   - 连续 CJK（含扩展区）：约 **1.5 token / 字**
+   - 其它（拉丁 / 数字 / 符号）：约 **0.25 token / 字**（≈ 4 chars / token）
+   - `estimateMessageTokens` = `estimateTokens(content) + estimateTokens(role) + 4`（role / 分隔符粗开销）
 3. **滑动窗口**：从最新消息向前填满输入预算；当前用户消息单独占预算
 4. **摘要压缩**（默认开启）：被滑出的旧消息经 `summarizeHistory` 压成 `【早期对话摘要】` 前置；摘要失败则仅滑动窗口。`summarizeHistory` 把旧对话拼成 transcript 后 **截断至 6000 字符**，提示词要求摘要 ≤200 字、不编造；失败返回 `null`
 
@@ -709,4 +725,6 @@ volumes:
 | Docker 知识库为空 | 确认 volume 首次为空从而触发 seed；或手动挂载 `data/knowledge` |
 | better-sqlite3 本地编译失败 | 需本机 Python / make / g++；Docker 构建已在 builder 阶段安装 |
 | 数据卷丢库 | 确认挂载了 `/app/data`（含 `chat.db` / `plans.db` / `uploads`） |
+| 只备份了 `.db` 却丢近期写入 | WAL 开启时须一并备份 `*-wal`/`*-shm`，或先 `wal_checkpoint` / 停进程 |
+| 前端等 `code: TIMEOUT` | 预期：该 helper 未接线；看 abort / 通用 error / 限流路径 |
 

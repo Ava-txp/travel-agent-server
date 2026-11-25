@@ -191,7 +191,8 @@ EVAL_DRY_TOOLS=0 npm run eval   # 真实调用工具（需外网）
 |------|------|
 | `id` / `query` | 用例名与用户问题 |
 | `expectTools` | 必须全部出现在 `toolTrace`；`[]` 表示期望尽量无工具（软约束，除非另有 `forbidTools`） |
-| `expectToolsAny` | 至少命中其一；若同时 `acceptRagWithoutTools` 且 RAG 有命中，可豁免 |
+| `expectToolsAny` | 至少命中其一 |
+| `acceptRagWithoutTools` | 与 `expectToolsAny` 联用：RAG 已命中时可豁免「必须调工具」 |
 | `forbidTools` | 出现即失败 |
 | `expectKeywordsAny` | 回答文本至少命中一个关键词 |
 | `requireRag` | 为 `true` 时 `retrieveKnowledge(query, topK=3)` 必须有命中 |
@@ -429,7 +430,7 @@ Authorization: Bearer <token>
 | `Connection` | `keep-alive` | 长连接 |
 | `X-Accel-Buffering` | `no` | 关 nginx 等反代缓冲，保证实时推送 |
 
-另会尽量 `flushHeaders()`，并在每次 `write` 后调用 compression 中间件提供的 `flush()`（若存在），避免 SSE 被整包缓冲。客户端已断开（`writableEnded` / `destroyed` / 非 `writable`）时不再写入。客户端断开时会 `AbortController.abort()` 取消 LLM。
+另会尽量 `flushHeaders()`，并在每次 `write` 后调用 `res.flush()`（若存在）。**当前未挂 compression 等缓冲中间件**，该调用是防御性的；真正防缓冲靠上面的响应头与反代配置。客户端已断开（`writableEnded` / `destroyed` / 非 `writable`）时不再写入。客户端断开时会 `AbortController.abort()` 取消 LLM。
 
 **无 `TIMEOUT` SSE `code`**：`llmErrors.isTimeoutError` 已实现（识别 408/504 与 timeout 文案），但 **chat / recommend 路由均未调用**；超时通常表现为客户端 abort、外网工具抛错原文，或归入通用 `error.message` / `RATE_LIMITED`，不要期待 `code: "TIMEOUT"`。
 
@@ -599,9 +600,22 @@ H5 当前消费 `conversationId` / `content`，不展示 `usage`；字段仍可�
 
 地理编码策略与 HTTP 逆地理互补：正向编码偏 Open-Meteo；逆地理偏 BigDataCloud。外网超时均为 8s。
 
+`dryTools` / `EVAL_DRY_TOOLS=1` 时：`geocodePlace` 对含「北京 / 上海 / 成都 / 杭州 / 东京 / 西安」的查询返回固定坐标，其它查询返回「模拟坐标」；`reverseGeocode` 固定「模拟城市」。评测无网时依赖这些桩，勿把桩坐标当成真实地理结果。
+
 ## 知识库（RAG）
 
 路径：`data/knowledge/*.md`。启动时（及 Docker entrypoint seed 后）按文件加载；按 `##` 二级标题切成 chunk，进程内缓存（改文件后需重启或 `loadKnowledgeChunks(true)`）。
+
+仓库内置 seed（与 `extractCityHint` 六城对齐；Docker `knowledge-seed` 同源）：
+
+| 文件 | frontmatter `city` | 主要 tags |
+|------|--------------------|-----------|
+| `beijing.md` | 北京 | 故宫,长城,颐和园,… |
+| `shanghai.md` | 上海 | 外滩,豫园,迪士尼,… |
+| `chengdu.md` | 成都 | 大熊猫,宽窄巷子,火锅,… |
+| `hangzhou.md` | 杭州 | 西湖,灵隐,宋城,龙井,… |
+| `xian.md` | 西安 | 兵马俑,城墙,回民街,… |
+| `tokyo.md` | 东京 | 浅草,涩谷,秋叶原,… |
 
 Frontmatter 示例：
 
@@ -700,7 +714,8 @@ volumes:
 | 多图分类不准 | `classifyScene` 只看第一张；管线抽取可再看多图 |
 | 登录后合并计数为 0 | body 未带与匿名期相同的 `clientId`；或匿名侧本无会话/规划 |
 | 登录后旧图 Invalid attachment | 上传不参与登录合并；重新上传后再发 |
-| 评测大量 FAIL / 退出码 1 | 查模型 Key；`requireRag` 用例需 `data/knowledge` 有内容；默认 dryTools，设 `EVAL_DRY_TOOLS=0` 才打真实天气/地理 |
+| 评测大量 FAIL / 退出码 1 | 查模型 Key；`requireRag` 用例需 `data/knowledge` 有内容（内置六城 md）；默认 dryTools，设 `EVAL_DRY_TOOLS=0` 才打真实天气/地理 |
+| dryTools 下城市像「模拟城市」/「模拟坐标」 | 预期：无网桩数据；六城有固定坐标，其它 query 走模拟 |
 | 上传图可打开但 chat 报 Invalid attachment | `GET /uploads/files/:id` 不校验归属；chat 引用须属当前 owner |
 | `/recommend` 立刻 400 JSON | 缺 `city` / `budget` / `days`，尚未进入 SSE |
 | `/recommend` 已开流但立刻 SSE error（天数/预算） | 缺字段才是 400；范围错误发生在 `stage` 之后 |

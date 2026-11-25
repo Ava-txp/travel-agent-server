@@ -45,6 +45,10 @@ Dockerfile       # 多阶段构建；entrypoint 首次 seed 知识库
 
 持久化约定（对照 `src/db/*`）：`chat.db` 由 `userStore` / `chatStore` / `uploadStore` 共用；`plans.db` 独立；均开启 `journal_mode=WAL` 与 `foreign_keys=ON`。Docker 把 `/app/data` 挂卷即可一并持久化库与上传。
 
+**连接与部署**：`userStore` / `chatStore` / `uploadStore` 各自 `new Database(chat.db)`（三句柄同库），`planStore` 另开 `plans.db`。WAL 下**单 Node 进程**并发读写没问题；不要多副本 / 多进程挂同一 data 卷一起写，否则易锁冲突或损坏。
+
+**轻量迁移**：无独立 migration 工具。`chatStore` 启动时用 `PRAGMA table_info` 检测缺列并 `ALTER TABLE` 补齐（`conversations.pinned` / `user_id`，`messages.attachments_json` / `scene_hint`）。旧 volume 升级只需拉新镜像并启动进程。
+
 **WAL 备份注意**：运行中还会出现同目录 sidecar `*.db-wal` / `*.db-shm`。只拷贝主 `.db` 可能丢未 checkpoint 的写入。安全做法：停进程后拷贝整组文件，或先对连接执行 `PRAGMA wal_checkpoint(TRUNCATE)` 再备份主库。
 
 ## 流程图
@@ -232,6 +236,8 @@ JWT（`src/utils/jwt.ts`）：payload 为 `{ sub: userId, account }`；校验后
 
 异步 handler 须包 `asyncHandler`，否则 Express 4 不会把 Promise reject 交给错误中间件。业务可预期错误优先在路由内直接 `res.status(4xx)`，与 `HttpError` 二选一即可。
 
+**现状**：`/api/auth/*` 已包 `asyncHandler`；旅行域 `/chat`、`/location/reverse` 等是裸 `async`，靠路由内 `try/catch`。改 `/chat` 时注意：开 SSE 之前的 DB / 读附件逻辑若不包进 `try` 且抛错，会变成 unhandledRejection（请求挂起），不会进 `errorHandler`。
+
 ## API 一览
 
 ### 通用
@@ -309,12 +315,14 @@ Authorization: Bearer <token>
 |------|------|
 | `/recommend` | 缺 `city`/`budget`/`days` → **400 JSON**（尚未进 SSE）。`days` 不在 1–30 或 `budget` 小于 100 → **已开 SSE**（先发 `stage:generating`），再以 SSE `error` 返回文案（无 `code`） |
 | `/chat` | `message` 与 `attachments` 至少其一；附件 **静默** `.slice(0, 3)`，非 `image`/缺 id 项丢弃（不因此 400）；须属当前 owner；未知 `sceneHint` 静默忽略为 `null` |
-| `/uploads/image` | JPEG / PNG / WebP；单文件 ≤ 5MB；multipart field 名必须为 `file` |
+| `/uploads/image` | JPEG / PNG / WebP；单文件 ≤ 5MB；multipart field 名必须为 `file`；`files: 1`（一次一请求一图） |
 | `/uploads/files/:id` | **无鉴权**；靠 UUID 不透明；按库内 `mime` 设 `Content-Type`；`Cache-Control: public, max-age=31536000, immutable` |
 | `/location/reverse` | query `lat`/`lon` 须为有限数字；纬度 ∈ [-90,90]，经度 ∈ [-180,180] |
 | `/conversations` PATCH | body 至少含 `title`（string）或 `pinned`（boolean）之一 |
 
-`POST /uploads/image` 成功：`{ status: "ok", data: { id, url, mime, width?, height? } }`，其中 `url` 形如 `/api/travel/uploads/files/<id>`。尺寸解析失败不阻断上传（宽高可缺）。`GET /uploads/files/:id` 用 `sendFile` 读 `data/uploads`；不存在 → 404 JSON `File not found`。聊天引用附件时只传 `{ id, type: "image" }`，由 `getOwnedUpload` 校验归属——**读文件接口本身不校验 owner**。
+`POST /uploads/image` 成功：`{ status: "ok", data: { id, url, mime, width?, height? } }`，其中 `url` 形如 `/api/travel/uploads/files/<id>`。尺寸解析失败不阻断上传（宽高可缺）。实现为 **multer `memoryStorage`**：整文件先入内存再 `writeFileSync` 落盘——并发大图会抬高 RSS。`GET /uploads/files/:id` 用 `sendFile` 读 `data/uploads`；不存在 → 404 JSON `File not found`。聊天引用附件时只传 `{ id, type: "image" }`，由 `getOwnedUpload` 校验归属——**读文件接口本身不校验 owner**。
+
+**无删除上传 API**：`uploadStore` 只有写入/按 id 读取；删会话仅 `DELETE conversations`（消息 `ON DELETE CASCADE`），**不会**删 `uploads` 行或 `data/uploads/*` 文件。磁盘与表会随使用增长，需运维侧按策略清理孤儿文件（或自行补删除接口）。
 
 #### 会话列表与 PATCH
 
@@ -464,6 +472,8 @@ Authorization: Bearer <token>
 | JSON 块缺失 / 解析失败 | `PARSE_FAILED` | `规划结果格式无效，请重试` |
 | 模型返回 `success:false` | `PARSE_FAILED` | 优先用模型 `message`，否则 `生成旅游规划失败` |
 | 上游限流 | `RATE_LIMITED` | `当前规划请求较多，请稍后再试`（`retryAfter` 缺省 12） |
+
+流结束后用 `extractJsonBlock`（`planJson.ts`）抽完整 JSON：优先 ```json / ``` 围栏，否则贪婪匹配首个 `{...}`。模型若输出多段花括号或夹杂解说，易抽错 → `PARSE_FAILED`；提示词侧宜要求单一 fenced JSON。
 
 增量推送条件（`planPartialParse.ts`）：`day` 须同时具备 `day` 数字与 `morning` / `afternoon` / `evening`（且各段 `spot` 非空）才发出；`budget` 在 `budgetBreakdown` 对象完整闭合后发出一次。
 
@@ -635,7 +645,7 @@ tags: 故宫,长城,颐和园
 ```
 
 - `type: both` 时，标题含「景点|必去」偏 attraction，「攻略|交通|美食|住宿|游玩」偏 guide
-- 检索（`retrieveKnowledge`）：中英 token；传入 `city` 时对「有 `chunk.city` 且与 hint 互不包含」的条目 **硬过滤**（空 `chunk.city` 仍可通过）；`scoreChunk` 内另有城市加分。system 注入 `topK=3`，工具 `search_*` 用 `topK=4`
+- 检索（`retrieveKnowledge`）：中英 token（汉字串会再切相邻 **bigram**）；传入 `city` 时对「有 `chunk.city` 且与 hint 互不包含」的条目 **硬过滤**（空 `chunk.city` 仍可通过）；`scoreChunk` 打分后 **`score > 0` 才保留**（零分直接丢掉）。system 注入 `topK=3`，工具 `search_*` 用 `topK=4`
 - Agent 侧 `extractCityHint` 硬编码城市：北京 / 上海 / 成都 / 杭州 / 东京 / 西安（按列表顺序取**首次命中**，非用户提及顺序）；未命中则不做城市过滤
 - 新增城市：在该目录加 Markdown → 本地重启；Docker 需更新镜像或挂载覆盖 volume（空 volume 仅首次从 seed 拷贝）；若要让对话自动带城市 hint，还需扩展 `extractCityHint` 列表
 
@@ -741,5 +751,10 @@ volumes:
 | better-sqlite3 本地编译失败 | 需本机 Python / make / g++；Docker 构建已在 builder 阶段安装 |
 | 数据卷丢库 | 确认挂载了 `/app/data`（含 `chat.db` / `plans.db` / `uploads`） |
 | 只备份了 `.db` 却丢近期写入 | WAL 开启时须一并备份 `*-wal`/`*-shm`，或先 `wal_checkpoint` / 停进程 |
+| `data/uploads` 只增不减 | 预期：无删除上传 API；删会话不级联文件；需运维清理或自研删除 |
+| 多副本挂同一 data 卷写坏库 | 预期：单进程设计；`chat.db` 上还有三句柄，勿水平扩展共享卷 |
+| 旧库缺 `pinned` / `attachments_json` 列 | 启动时 `chatStore` 会 ALTER 补列；确认进程已成功起来 |
+| 上传并发时内存飙升 | multer `memoryStorage` 整图进 RAM；可降并发或改磁盘存储 |
+| 规划总 `PARSE_FAILED` 但模型像有 JSON | 看是否无围栏 / 多段 `{}`；`extractJsonBlock` 贪婪匹配易抽错 |
 | 前端等 `code: TIMEOUT` | 预期：该 helper 未接线；看 abort / 通用 error / 限流路径 |
 

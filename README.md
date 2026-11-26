@@ -238,6 +238,20 @@ JWT（`src/utils/jwt.ts`）：payload 为 `{ sub: userId, account }`；校验后
 
 **现状**：`/api/auth/*` 已包 `asyncHandler`；旅行域 `/chat`、`/location/reverse` 等是裸 `async`，靠路由内 `try/catch`。改 `/chat` 时注意：开 SSE 之前的 DB / 读附件逻辑若不包进 `try` 且抛错，会变成 unhandledRejection（请求挂起），不会进 `errorHandler`。
 
+### 调试日志残留（运维）
+
+生产日志里仍会见到下列 **`console.log` / `console.error`**（非结构化、默认全开）：
+
+| 位置 | 内容 | 注意 |
+|------|------|------|
+| `routes/travel.ts` `/chat` | `message` + 用户原文、`conversationId`、`userId`、`location`、附件 id、`sceneHint` | **含用户输入 / 坐标**；排障有用，也有隐私与噪音风险 |
+| 同上 abort 路径 | `client disconnected…` / `chat stopped early, partial response kept on client` | 文案写「client」，但非空助手文本仍可能已落库 |
+| `contextWindow.ts` | 每轮 `[contextWindow] in≈…/… hist … kept=… dropped=… summarized=…` | 长对话高频；可对照 `done.usage` |
+| `travelService` / `travelAgent` | `initLLM` / `initVisionLLM`、Vision 路径、`tool_call` 名与参数、abort partial 长度 | 启动与工具轮噪音；工具 args 可能含城市/坐标 |
+| `errorHandler` | `unhandled error` + 堆栈 | 预期的兜底 |
+
+上线若要降噪或脱敏，优先改 `/chat` 入口那条与 `[contextWindow]`；不要误当成「已关 debug」。
+
 ## API 一览
 
 ### 通用
@@ -256,7 +270,7 @@ JWT（`src/utils/jwt.ts`）：payload 为 `{ sub: userId, account }`；校验后
 | `GET` | `/me` | 当前用户（需 Bearer Token） |
 | `POST` | `/logout` | 登出（服务端无状态；客户端丢弃 Token 即可） |
 
-约束：`account` 为大陆手机号（`1` + 10 位）或邮箱；邮箱存小写；密码 ≥ 6 位；昵称可选、最长 20（缺省按手机后四位或邮箱前缀生成）；密码哈希为 **bcryptjs、`BCRYPT_ROUNDS = 10`**（`src/routes/auth.ts`）；未设 `JWT_SECRET` 时鉴权路由不可用。Body 解析支持 `application/json` 与 `application/x-www-form-urlencoded`（见 `src/index.ts`）。
+约束：`account` 为大陆手机号（`1` + 10 位）或邮箱；邮箱存小写；密码 ≥ 6 位；昵称可选、最长 20（缺省按手机后四位或邮箱前缀生成）；密码哈希为 **bcryptjs、`BCRYPT_ROUNDS = 10`**（`src/routes/auth.ts`）；未设 `JWT_SECRET` 时鉴权路由不可用。Body 解析支持 `application/json` 与 `application/x-www-form-urlencoded`（见 `src/index.ts`）；二者均走 Express/body-parser **默认 `limit: 100kb`**（未在代码里改大）。超限会抛 `PayloadTooLargeError`（HTTP **413**，`expose === true`），由 `errorHandler` 原样回 `{ status:"error", message }`；畸形 JSON 同理多为 **400**。大图上传不走 JSON body（multipart + multer），不受这 100kb 限制。
 
 `POST /register` / `POST /login` 成功（`issueAuthResponse`，HTTP 200）：
 
@@ -757,4 +771,7 @@ volumes:
 | 上传并发时内存飙升 | multer `memoryStorage` 整图进 RAM；可降并发或改磁盘存储 |
 | 规划总 `PARSE_FAILED` 但模型像有 JSON | 看是否无围栏 / 多段 `{}`；`extractJsonBlock` 贪婪匹配易抽错 |
 | 前端等 `code: TIMEOUT` | 预期：该 helper 未接线；看 abort / 通用 error / 限流路径 |
-
+| 请求体过大 413 / 畸形 JSON 400 | `express.json` / `urlencoded` 默认 **100kb**；超限或坏 JSON 经 `errorHandler` 暴露 message；大图走 multipart 不受此限 |
+| 日志刷屏 `message` / `[contextWindow]` / `tool_call` | 预期：见上文「调试日志残留」；`/chat` 会打印用户原文，生产需脱敏或降级 |
+| 日志写 partial kept on client 但库里有半截助手消息 | 预期：abort 路径仍可能 `addMessage`；以库为准，勿只信那句 log |
+|
